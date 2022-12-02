@@ -1,8 +1,9 @@
 .idea
-./__pycache
-./buffer
-./data
-./logged_file
-./outs
-./wandb
-./tmp.ipynb
+__pycache__
+.vscode
+buffer
+data
+logged_files
+outs
+wandb
+tmp.ipynb

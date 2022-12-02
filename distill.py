@@ -30,6 +30,7 @@ def main(args):
 
     args.dsa = True if args.dsa == 'True' else False
     args.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print("Device: ", args.device)
 
     eval_it_pool = np.arange(0, args.Iteration + 1, args.eval_it).tolist()
     channel, im_size, num_classes, class_names, mean, std, dst_train, dst_test, testloader, loader_train_dict, class_map, class_map_inv = get_dataset(args.dataset, args.data_path, args.batch_real, args.subset, args=args)
@@ -228,7 +229,7 @@ def main(args):
 
         if it in eval_it_pool and (save_this_it or it % 1000 == 0):
             with torch.no_grad():
-                image_save = image_syn.cuda()
+                image_save = image_syn.to(device)
 
                 save_dir = os.path.join(".", "logged_files", args.dataset, wandb.run.name)
 
@@ -362,13 +363,16 @@ def main(args):
                 forward_params = student_params[-1].unsqueeze(0).expand(torch.cuda.device_count(), -1)
             else:
                 forward_params = student_params[-1]
+                
+            # train student net
             x = student_net(x, flat_param=forward_params)
             ce_loss = criterion(x, this_y)
 
+            # create computation graph so that when compute the distance loss, can have the higher order derivative products
             grad = torch.autograd.grad(ce_loss, student_params[-1], create_graph=True)[0]
 
+            # optimize the student net weights
             student_params.append(student_params[-1] - syn_lr * grad)
-
 
         param_loss = torch.tensor(0.0).to(args.device)
         param_dist = torch.tensor(0.0).to(args.device)
@@ -448,7 +452,7 @@ if __name__ == '__main__':
                         help='differentiable Siamese augmentation strategy')
 
     parser.add_argument('--data_path', type=str, default='data', help='dataset path')
-    parser.add_argument('--buffer_path', type=str, default='./buffers', help='buffer path')
+    parser.add_argument('--buffer_path', type=str, default='./buffer', help='buffer path')
 
     parser.add_argument('--expert_epochs', type=int, default=3, help='how many expert epochs the target params are')
     parser.add_argument('--syn_steps', type=int, default=20, help='how many steps to take on synthetic data')
