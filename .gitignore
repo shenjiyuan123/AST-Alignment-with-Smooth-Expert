@@ -1,1 +1,8 @@
 .idea
+./__pycache
+./buffer
+./data
+./logged_file
+./outs
+./wandb
+./tmp.ipynb
