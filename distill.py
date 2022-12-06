@@ -229,7 +229,7 @@ def main(args):
 
         if it in eval_it_pool and (save_this_it or it % 1000 == 0):
             with torch.no_grad():
-                image_save = image_syn.to(device)
+                image_save = image_syn.to(args.device)
 
                 save_dir = os.path.join(".", "logged_files", args.dataset, wandb.run.name)
 
@@ -420,12 +420,12 @@ if __name__ == '__main__':
 
     parser.add_argument('--model', type=str, default='ConvNet', help='model')
 
-    parser.add_argument('--ipc', type=int, default=1, help='image(s) per class')
+    parser.add_argument('--ipc', type=int, default=10, help='image(s) per class')
 
     parser.add_argument('--eval_mode', type=str, default='S',
                         help='eval_mode, check utils.py for more info')
 
-    parser.add_argument('--num_eval', type=int, default=5, help='how many networks to evaluate on')
+    parser.add_argument('--num_eval', type=int, default=1, help='how many networks to evaluate on')
 
     parser.add_argument('--eval_it', type=int, default=100, help='how often to evaluate')
 
