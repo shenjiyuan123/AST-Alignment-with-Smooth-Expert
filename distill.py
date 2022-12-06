@@ -136,9 +136,9 @@ def main(args):
     ''' training '''
     image_syn = image_syn.detach().to(args.device).requires_grad_(True)
     syn_lr = syn_lr.detach().to(args.device).requires_grad_(True)
-    optimizer_img = torch.optim.SGD([image_syn], lr=args.lr_img, momentum=0.5)
+    optimizer_img_all_order = torch.optim.SGD([image_syn], lr=args.lr_img, momentum=0.5)
     optimizer_lr = torch.optim.SGD([syn_lr], lr=args.lr_lr, momentum=0.5)
-    optimizer_img.zero_grad()
+    optimizer_img_all_order.zero_grad()
 
     criterion = nn.CrossEntropyLoss().to(args.device)
     print('%s training begins'%get_time())
@@ -190,6 +190,7 @@ def main(args):
         wandb.log({"Progress": it}, step=it)
         ''' Evaluate synthetic data '''
         if it in eval_it_pool:
+            continue
             for model_eval in model_eval_pool:
                 print('-------------------------\nEvaluation\nmodel_train = %s, model_eval = %s, iteration = %d'%(args.model, model_eval, it))
                 if args.dsa:
@@ -228,6 +229,7 @@ def main(args):
 
 
         if it in eval_it_pool and (save_this_it or it % 1000 == 0):
+            continue
             with torch.no_grad():
                 image_save = image_syn.to(args.device)
 
@@ -340,8 +342,10 @@ def main(args):
         param_dist_list = []
         indices_chunks = []
 
-        for step in range(args.syn_steps):
-
+        for step in range(args.syn_steps-1):
+            if step>2:
+                break
+            # if use batch_syn, will random sample a batch of syn. else, sample all.
             if not indices_chunks:
                 indices = torch.randperm(len(syn_images))
                 indices_chunks = list(torch.split(indices, args.batch_syn))
@@ -373,6 +377,31 @@ def main(args):
 
             # optimize the student net weights
             student_params.append(student_params[-1] - syn_lr * grad)
+            
+        # for the syn_steps, only back-propogate the first order
+        if not indices_chunks:
+            indices = torch.randperm(len(syn_images))
+            indices_chunks = list(torch.split(indices, args.batch_syn))
+
+        these_indices = indices_chunks.pop()
+
+        syn_im = copy.deepcopy(syn_images)
+        x = syn_im[these_indices]
+        this_y = y_hat[these_indices]
+        
+        if args.distributed:
+            forward_params = student_params[-1].unsqueeze(0).expand(torch.cuda.device_count(), -1)
+        else:
+            forward_params = student_params[-1]
+            
+        # train student net
+        x = student_net(x, flat_param=forward_params)
+        ce_loss = criterion(x, this_y)
+        grad = torch.autograd.grad(ce_loss, student_params[-1], create_graph=True)[0]
+        student_params.append(student_params[-1] - syn_lr * grad)
+        
+        optimizer_img = torch.optim.SGD([syn_im], lr=args.lr_img, momentum=0.5)
+        
 
         param_loss = torch.tensor(0.0).to(args.device)
         param_dist = torch.tensor(0.0).to(args.device)
@@ -394,10 +423,14 @@ def main(args):
         optimizer_img.zero_grad()
         optimizer_lr.zero_grad()
 
+        image_syn.requires_grad_(False)
         grand_loss.backward()
 
         optimizer_img.step()
         optimizer_lr.step()
+        
+        image_syn = syn_im
+
 
         wandb.log({"Grand_Loss": grand_loss.detach().cpu(),
                    "Start_Epoch": start_epoch})
