@@ -190,7 +190,8 @@ def main(args):
         wandb.log({"Progress": it}, step=it)
         ''' Evaluate synthetic data '''
         if it in eval_it_pool:
-            continue
+            # XXX: for debug
+            # continue
             for model_eval in model_eval_pool:
                 print('-------------------------\nEvaluation\nmodel_train = %s, model_eval = %s, iteration = %d'%(args.model, model_eval, it))
                 if args.dsa:
@@ -229,7 +230,8 @@ def main(args):
 
 
         if it in eval_it_pool and (save_this_it or it % 1000 == 0):
-            continue
+            # XXX: for debug
+            # continue
             with torch.no_grad():
                 image_save = image_syn.to(args.device)
 
@@ -343,8 +345,9 @@ def main(args):
         indices_chunks = []
 
         for step in range(args.syn_steps-1):
-            if step>2:
-                break
+            # XXX: for debug
+            # if step>2:
+            #     break
             # if use batch_syn, will random sample a batch of syn. else, sample all.
             if not indices_chunks:
                 indices = torch.randperm(len(syn_images))
