@@ -416,10 +416,10 @@ def main(args):
         param_dist_list.append(param_dist)
 
 
-        param_loss /= num_params
-        param_dist /= num_params
+        # param_loss /= num_params
+        # param_dist /= num_params
 
-        param_loss /= param_dist
+        param_loss /= (param_dist + 0.1)
 
         grand_loss = param_loss
 
@@ -428,6 +428,8 @@ def main(args):
 
         image_syn.requires_grad_(False)
         grand_loss.backward()
+        
+        torch.nn.utils.clip_grad_norm_(syn_im, 1.2)
 
         optimizer_img.step()
         optimizer_lr.step()
