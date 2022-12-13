@@ -11,5 +11,4 @@
 
 
 
-python distill.py --dataset=CIFAR10 --ipc=10 --syn_steps=30 --expert_epochs=2 --max_start_epoch=20 --zca --lr_img=1000 --lr_lr=1e-04 --lr_teacher=0.01 \
-                  --buffer_path='/export/home2/jiyuan/mtt-distillation/buffer' --data_path='/export/home2/jiyuan/mtt-distillation/data'
+python distill.py --dataset=CIFAR10 --ipc=10 --syn_steps=30 --expert_epochs=2 --max_start_epoch=20 --zca --lr_img=1000 --lr_lr=1e-05 --lr_teacher=0.01 --buffer_path='buffer' --data_path='data'

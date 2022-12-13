@@ -109,7 +109,9 @@ def main(args):
 
 
     ''' initialize the synthetic data '''
-    label_syn = torch.tensor([np.ones(args.ipc,dtype=np.int_)*i for i in range(num_classes)], dtype=torch.long, requires_grad=False, device=args.device).view(-1) # [0,0,0, 1,1,1, ..., 9,9,9]
+    label_syn = torch.tensor([np.ones(args.ipc,dtype=np.int_)*i for i in range(num_classes)], dtype=torch.long, device=args.device).view(-1) # [0,0,0, 1,1,1, ..., 9,9,9]
+    label_syn_one_hot = F.one_hot(label_syn, num_classes).float().requires_grad_(True)
+    
 
     if args.texture:
         image_syn = torch.randn(size=(num_classes * args.ipc, channel, im_size[0]*args.canvas_size, im_size[1]*args.canvas_size), dtype=torch.float)
@@ -136,9 +138,14 @@ def main(args):
     ''' training '''
     image_syn = image_syn.detach().to(args.device).requires_grad_(True)
     syn_lr = syn_lr.detach().to(args.device).requires_grad_(True)
-    optimizer_img_all_order = torch.optim.SGD([image_syn], lr=args.lr_img, momentum=0.5)
+    # optimizer_img_all_order = torch.optim.SGD([image_syn], lr=args.lr_img, momentum=0.5)
     optimizer_lr = torch.optim.SGD([syn_lr], lr=args.lr_lr, momentum=0.5)
-    optimizer_img_all_order.zero_grad()
+    optimizer_img = torch.optim.SGD([image_syn], lr=args.lr_img, momentum=0.5)
+    # optimizer_label = torch.optim.SGD([label_syn_one_hot], lr=0.001, momentum=0.5)
+    optimizer_label = torch.optim.Adam([label_syn_one_hot], lr=0.001, weight_decay=0.0005)
+    
+    optimizer_img.zero_grad()
+    optimizer_label.zero_grad()
 
     criterion = nn.CrossEntropyLoss().to(args.device)
     print('%s training begins'%get_time())
@@ -227,6 +234,7 @@ def main(args):
                 wandb.log({'Max_Accuracy/{}'.format(model_eval): best_acc[model_eval]}, step=it)
                 wandb.log({'Std/{}'.format(model_eval): acc_test_std}, step=it)
                 wandb.log({'Max_Std/{}'.format(model_eval): best_std[model_eval]}, step=it)
+                wandb.log({'label_syn/{}'.format(model_eval): label_syn_one_hot}, step=it)
 
 
         if it in eval_it_pool and (save_this_it or it % 1000 == 0):
@@ -338,13 +346,14 @@ def main(args):
 
         syn_images = image_syn
 
-        y_hat = label_syn.to(args.device)
+        # y_hat = label_syn.to(args.device)
+        # print(f"syn label example: 0. {label_syn_one_hot[0]} \n 10. {label_syn_one_hot[10]} \n last. {label_syn_one_hot[-1]}")
 
         param_loss_list = []
         param_dist_list = []
         indices_chunks = []
 
-        for step in range(args.syn_steps-1):
+        for step in range(args.syn_steps):
             # XXX: for debug
             # if step>2:
             #     break
@@ -357,7 +366,7 @@ def main(args):
 
 
             x = syn_images[these_indices]
-            this_y = y_hat[these_indices]
+            this_y = label_syn_one_hot[these_indices]
 
             if args.texture:
                 x = torch.cat([torch.stack([torch.roll(im, (torch.randint(im_size[0]*args.canvas_size, (1,)), torch.randint(im_size[1]*args.canvas_size, (1,))), (1,2))[:,:im_size[0],:im_size[1]] for im in x]) for _ in range(args.canvas_samples)])
@@ -376,35 +385,14 @@ def main(args):
             ce_loss = criterion(x, this_y)
 
             # create computation graph so that when compute the distance loss, can have the higher order derivative products
-            grad = torch.autograd.grad(ce_loss, student_params[-1], create_graph=True)[0]
+            if step == args.syn_steps-1:
+                grad = torch.autograd.grad(ce_loss, student_params[-1], create_graph=True)[0]
+            else:
+                grad = torch.autograd.grad(ce_loss, student_params[-1])[0]
 
             # optimize the student net weights
             student_params.append(student_params[-1] - syn_lr * grad)
             
-        # for the syn_steps, only back-propogate the first order
-        if not indices_chunks:
-            indices = torch.randperm(len(syn_images))
-            indices_chunks = list(torch.split(indices, args.batch_syn))
-
-        these_indices = indices_chunks.pop()
-
-        syn_im = copy.deepcopy(syn_images)
-        x = syn_im[these_indices]
-        this_y = y_hat[these_indices]
-        
-        if args.distributed:
-            forward_params = student_params[-1].unsqueeze(0).expand(torch.cuda.device_count(), -1)
-        else:
-            forward_params = student_params[-1]
-            
-        # train student net
-        x = student_net(x, flat_param=forward_params)
-        ce_loss = criterion(x, this_y)
-        grad = torch.autograd.grad(ce_loss, student_params[-1], create_graph=True)[0]
-        student_params.append(student_params[-1] - syn_lr * grad)
-        
-        optimizer_img = torch.optim.SGD([syn_im], lr=args.lr_img, momentum=0.5)
-        
 
         param_loss = torch.tensor(0.0).to(args.device)
         param_dist = torch.tensor(0.0).to(args.device)
@@ -426,15 +414,13 @@ def main(args):
         optimizer_img.zero_grad()
         optimizer_lr.zero_grad()
 
-        image_syn.requires_grad_(False)
         grand_loss.backward()
         
-        torch.nn.utils.clip_grad_norm_(syn_im, 1.2)
+        torch.nn.utils.clip_grad_norm_(image_syn, 1.2)
 
         optimizer_img.step()
+        optimizer_label.step()
         optimizer_lr.step()
-        
-        image_syn = syn_im
 
 
         wandb.log({"Grand_Loss": grand_loss.detach().cpu(),
