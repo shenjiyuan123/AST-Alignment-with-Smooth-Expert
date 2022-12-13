@@ -2,8 +2,8 @@
 #SBATCH -J mtt_cifar10
 #SBATCH -N 1
 #SBATCH -n 1
-#SBATCH --partition=PA40q
-#SBATCH -w node05
+#SBATCH --partition=RTXq
+#SBATCH -w node30
 #SBATCH --gres=gpu:2
 #SBATCH --output /export/home2/jiyuan/mtt-distillation/outs/distill.out
 

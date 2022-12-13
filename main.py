@@ -1,3 +1,4 @@
+import yaml
 import os
 import argparse
 import numpy as np
@@ -11,21 +12,84 @@ import wandb
 import copy
 import random
 from reparam_module import ReparamModule
+from unet import UNet
 
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-def main(args):
+def parse_args():
+    parser = argparse.ArgumentParser(description='Parameter Processing')
 
-    if args.zca and args.texture:
-        raise AssertionError("Cannot use zca and texture together")
+    parser.add_argument('--dataset', type=str, default='CIFAR10', help='dataset')
 
-    if args.texture and args.pix_init == "real":
-        print("WARNING: Using texture with real initialization will take a very long time to smooth out the boundaries between images.")
+    parser.add_argument('--subset', type=str, default='imagenette', help='ImageNet subset. This only does anything when --dataset=ImageNet')
 
-    if args.max_experts is not None and args.max_files is not None:
-        args.total_experts = args.max_experts * args.max_files
+    parser.add_argument('--model', type=str, default='ConvNet', help='model')
 
+    parser.add_argument('--ipc', type=int, default=10, help='image(s) per class')
+
+    parser.add_argument('--eval_mode', type=str, default='S',
+                        help='eval_mode, check utils.py for more info')
+
+    parser.add_argument('--num_eval', type=int, default=1, help='how many networks to evaluate on')
+
+    parser.add_argument('--eval_it', type=int, default=100, help='how often to evaluate')
+
+    parser.add_argument('--epoch_eval_train', type=int, default=1000, help='epochs to train a model with synthetic data')
+    parser.add_argument('--Iteration', type=int, default=5000, help='how many distillation steps to perform')
+
+    parser.add_argument('--lr_img', type=float, default=1000, help='learning rate for updating synthetic images')
+    parser.add_argument('--lr_unet', type=float, default=1e-04, help='learning rate for updating unet')
+    parser.add_argument('--lr_lr', type=float, default=1e-05, help='learning rate for updating... learning rate')
+    parser.add_argument('--lr_teacher', type=float, default=0.01, help='initialization for synthetic learning rate')
+
+    parser.add_argument('--lr_init', type=float, default=0.01, help='how to init lr (alpha)')
+
+    parser.add_argument('--batch_real', type=int, default=256, help='batch size for real data')
+    parser.add_argument('--batch_syn', type=int, default=None, help='should only use this if you run out of VRAM')
+    parser.add_argument('--batch_train', type=int, default=256, help='batch size for training networks')
+
+    parser.add_argument('--pix_init', type=str, default='real', choices=["noise", "real"],
+                        help='noise/real: initialize synthetic images from random noise or randomly sampled real images.')
+
+    parser.add_argument('--dsa', type=str, default='True', choices=['True', 'False'],
+                        help='whether to use differentiable Siamese augmentation.')
+
+    parser.add_argument('--dsa_strategy', type=str, default='color_crop_cutout_flip_scale_rotate',
+                        help='differentiable Siamese augmentation strategy')
+
+    parser.add_argument('--data_path', type=str, default='data', help='dataset path')
+    parser.add_argument('--buffer_path', type=str, default='./buffer', help='buffer path')
+
+    parser.add_argument('--expert_epochs', type=int, default=3, help='how many expert epochs the target params are')
+    parser.add_argument('--syn_steps', type=int, default=20, help='how many steps to take on synthetic data')
+    parser.add_argument('--max_start_epoch', type=int, default=25, help='max epoch we can start at')
+
+    parser.add_argument('--zca', action='store_true', help="do ZCA whitening")
+
+    parser.add_argument('--load_all', action='store_true', help="only use if you can fit all expert trajectories into RAM")
+
+    parser.add_argument('--no_aug', type=bool, default=False, help='this turns off diff aug during distillation')
+
+    parser.add_argument('--texture', action='store_true', help="will distill textures instead")
+    parser.add_argument('--canvas_size', type=int, default=2, help='size of synthetic canvas')
+    parser.add_argument('--canvas_samples', type=int, default=1, help='number of canvas samples per iteration')
+
+
+    parser.add_argument('--max_files', type=int, default=None, help='number of expert files to read (leave as None unless doing ablations)')
+    parser.add_argument('--max_experts', type=int, default=None, help='number of experts to read per file (leave as None unless doing ablations)')
+
+    parser.add_argument('--force_save', action='store_true', help='this will save images for 50ipc')
+
+    args = parser.parse_args()
+    return args
+
+
+
+def main():
+    ''' initialization '''
+    args = parse_args()
+    
     print("CUDNN STATUS: {}".format(torch.backends.cudnn.enabled))
 
     args.dsa = True if args.dsa == 'True' else False
@@ -64,7 +128,7 @@ def main(args):
                config=args,
                )
 
-    args = type('', (), {})()
+    # args = type('', (), {})()
 
     for key in wandb.config._items:
         setattr(args, key, wandb.config._items[key])
@@ -80,7 +144,9 @@ def main(args):
 
     print('Hyper-parameters: \n', args.__dict__)
     print('Evaluation model pool: ', model_eval_pool)
-
+    
+    
+    
     ''' organize the real dataset '''
     images_all = []
     labels_all = []
@@ -92,7 +158,9 @@ def main(args):
         labels_all.append(class_map[torch.tensor(sample[1]).item()])
 
     for i, lab in tqdm(enumerate(labels_all)):
+        # categorize all the images indices according to their class
         indices_class[lab].append(i)
+        
     images_all = torch.cat(images_all, dim=0).to("cpu")
     labels_all = torch.tensor(labels_all, dtype=torch.long, device="cpu")
 
@@ -106,50 +174,37 @@ def main(args):
     def get_images(c, n):  # get random n images from class c
         idx_shuffle = np.random.permutation(indices_class[c])[:n]
         return images_all[idx_shuffle]
-
-
-    ''' initialize the synthetic data '''
-    label_syn = torch.tensor([np.ones(args.ipc,dtype=np.int_)*i for i in range(num_classes)], dtype=torch.long, device=args.device).view(-1) # [0,0,0, 1,1,1, ..., 9,9,9]
-    label_syn_one_hot = F.one_hot(label_syn, num_classes).float().requires_grad_(True)
     
-
-    if args.texture:
-        image_syn = torch.randn(size=(num_classes * args.ipc, channel, im_size[0]*args.canvas_size, im_size[1]*args.canvas_size), dtype=torch.float)
-    else:
-        image_syn = torch.randn(size=(num_classes * args.ipc, channel, im_size[0], im_size[1]), dtype=torch.float)
+    
+    
+    ''' initialize the synthetic data according to a UNet '''
+    label_syn = torch.tensor([np.ones(args.ipc,dtype=np.int_)*i for i in range(num_classes)], 
+                             dtype=torch.long).view(-1).to(args.device) # [0,0,0, 1,1,1, ..., 9,9,9]
+    image_syn = torch.randn(size=(num_classes * args.ipc, channel, im_size[0], im_size[1]), dtype=torch.float)
 
     syn_lr = torch.tensor(args.lr_teacher).to(args.device)
-
-    if args.pix_init == 'real':
+    
+    if args.pix_init =='real':
         print('initialize synthetic data from random real images')
-        if args.texture:
-            for c in range(num_classes):
-                for i in range(args.canvas_size):
-                    for j in range(args.canvas_size):
-                        image_syn.data[c * args.ipc:(c + 1) * args.ipc, :, i * im_size[0]:(i + 1) * im_size[0],
-                        j * im_size[1]:(j + 1) * im_size[1]] = torch.cat(
-                            [get_images(c, 1).detach().data for s in range(args.ipc)])
         for c in range(num_classes):
-            image_syn.data[c * args.ipc:(c + 1) * args.ipc] = get_images(c, args.ipc).detach().data
+            image_syn.data[c*args.ipc:(c+1)*args.ipc] = get_images(c, args.ipc).detach().data
     else:
         print('initialize synthetic data from random noise')
-
-
-    ''' training '''
-    image_syn = image_syn.detach().to(args.device).requires_grad_(True)
-    syn_lr = syn_lr.detach().to(args.device).requires_grad_(True)
-    # optimizer_img_all_order = torch.optim.SGD([image_syn], lr=args.lr_img, momentum=0.5)
-    optimizer_lr = torch.optim.SGD([syn_lr], lr=args.lr_lr, momentum=0.5)
-    optimizer_img = torch.optim.SGD([image_syn], lr=args.lr_img, momentum=0.5)
-    # optimizer_label = torch.optim.SGD([label_syn_one_hot], lr=0.001, momentum=0.5)
-    optimizer_label = torch.optim.Adam([label_syn_one_hot], lr=0.001, weight_decay=0.0005)
+        
+    unet_image = UNet(3,3).to(args.device)
     
-    optimizer_img.zero_grad()
-    optimizer_label.zero_grad()
-
+    if args.distributed:
+            unet_image = torch.nn.DataParallel(unet_image)
+    
+    ''' training '''
+    syn_lr = syn_lr.detach().to(args.device).requires_grad_(True)
+    optimizer_lr = torch.optim.SGD([syn_lr], lr=args.lr_lr, momentum=0.5)
+    optimizer_unet = torch.optim.Adam(unet_image.parameters(), lr=args.lr_unet)
+    # optimizer_label = torch.optim.SGD([label_syn], lr=args.lr_lr, momentum=0.5)
+    
     criterion = nn.CrossEntropyLoss().to(args.device)
     print('%s training begins'%get_time())
-
+    
     expert_dir = os.path.join(args.buffer_path, args.dataset)
     if args.dataset == "ImageNet":
         expert_dir = os.path.join(expert_dir, args.subset, str(args.res))
@@ -157,7 +212,7 @@ def main(args):
         expert_dir += "_NO_ZCA"
     expert_dir = os.path.join(expert_dir, args.model)
     print("Expert Dir: {}".format(expert_dir))
-
+        
     if args.load_all:
         buffer = []
         n = 0
@@ -168,6 +223,7 @@ def main(args):
             raise AssertionError("No buffers detected at {}".format(expert_dir))
 
     else:
+        # each time will load one .pt file into the RAM, which contains 10 expert traces.
         expert_files = []
         n = 0
         while os.path.exists(os.path.join(expert_dir, "replay_buffer_{}.pt".format(n))):
@@ -189,11 +245,11 @@ def main(args):
     best_acc = {m: 0 for m in model_eval_pool}
 
     best_std = {m: 0 for m in model_eval_pool}
-
-    for it in range(0, args.Iteration+1):
-        save_this_it = False
-
-        # writer.add_scalar('Progress', it, it)
+    
+    for it in range(0, args.Iteration):
+        
+        # TODO: add the evaluation process
+        
         wandb.log({"Progress": it}, step=it)
         ''' Evaluate synthetic data '''
         if it in eval_it_pool:
@@ -234,7 +290,6 @@ def main(args):
                 wandb.log({'Max_Accuracy/{}'.format(model_eval): best_acc[model_eval]}, step=it)
                 wandb.log({'Std/{}'.format(model_eval): acc_test_std}, step=it)
                 wandb.log({'Max_Std/{}'.format(model_eval): best_std[model_eval]}, step=it)
-                wandb.log({'label_syn/{}'.format(model_eval): label_syn_one_hot}, step=it)
 
 
         if it in eval_it_pool and (save_this_it or it % 1000 == 0):
@@ -303,7 +358,7 @@ def main(args):
                                 torch.nan_to_num(grid.detach().cpu()))}, step=it)
 
         wandb.log({"Synthetic_LR": syn_lr.detach().cpu()}, step=it)
-
+        
         student_net = get_network(args.model, channel, num_classes, im_size, dist=False).to(args.device)  # get a random model
 
         student_net = ReparamModule(student_net)
@@ -312,8 +367,7 @@ def main(args):
             student_net = torch.nn.DataParallel(student_net)
 
         student_net.train()
-
-        num_params = sum([np.prod(p.size()) for p in (student_net.parameters())])
+        unet_image.train()
 
         if args.load_all:
             expert_trajectory = buffer[np.random.randint(0, len(buffer))]
@@ -333,7 +387,8 @@ def main(args):
                 if args.max_experts is not None:
                     buffer = buffer[:args.max_experts]
                 random.shuffle(buffer)
-
+                
+        ''' initialize the starting parameters '''
         start_epoch = np.random.randint(0, args.max_start_epoch)
         starting_params = expert_trajectory[start_epoch]
 
@@ -344,56 +399,57 @@ def main(args):
 
         starting_params = torch.cat([p.data.to(args.device).reshape(-1) for p in starting_params], 0)
 
-        syn_images = image_syn
+        # syn_images = image_syn
+        # time_embedding = torch.randint(args.Iteration, (args.batch_syn, )).to(args.device)
+        image_syn = image_syn.requires_grad_(False).to(device=args.device)
+        syn_images = unet_image(image_syn)
 
-        # y_hat = label_syn.to(args.device)
-        # print(f"syn label example: 0. {label_syn_one_hot[0]} \n 10. {label_syn_one_hot[10]} \n last. {label_syn_one_hot[-1]}")
+        # syn_labels = label_syn.requires_grad_(True).to(args.device)
+        syn_labels = label_syn
 
         param_loss_list = []
         param_dist_list = []
         indices_chunks = []
-
+        
+        ''' train network on synthetic set for args.syn_steps '''
         for step in range(args.syn_steps):
-            # XXX: for debug
-            # if step>2:
-            #     break
-            # if use batch_syn, will random sample a batch of syn. else, sample all.
+            
             if not indices_chunks:
-                indices = torch.randperm(len(syn_images))
+                indices = torch.randperm(len(syn_images))  # shuffle the syn_images indices
                 indices_chunks = list(torch.split(indices, args.batch_syn))
-
-            these_indices = indices_chunks.pop()
-
-
-            x = syn_images[these_indices]
-            this_y = label_syn_one_hot[these_indices]
-
-            if args.texture:
-                x = torch.cat([torch.stack([torch.roll(im, (torch.randint(im_size[0]*args.canvas_size, (1,)), torch.randint(im_size[1]*args.canvas_size, (1,))), (1,2))[:,:im_size[0],:im_size[1]] for im in x]) for _ in range(args.canvas_samples)])
-                this_y = torch.cat([this_y for _ in range(args.canvas_samples)])
-
-            if args.dsa and (not args.no_aug):
-                x = DiffAugment(x, args.dsa_strategy, param=args.dsa_param)
-
-            if args.distributed:
-                forward_params = student_params[-1].unsqueeze(0).expand(torch.cuda.device_count(), -1)
-            else:
-                forward_params = student_params[-1]
                 
-            # train student net
-            x = student_net(x, flat_param=forward_params)
-            ce_loss = criterion(x, this_y)
+            ce_loss_total = 0
+            
+            while indices_chunks:
+                these_indices = indices_chunks.pop(0)
+                x = syn_images[these_indices]
+                y = syn_labels[these_indices]
+                
+                if args.dsa and (not args.no_aug):
+                    x = DiffAugment(x, args.dsa_strategy, param=args.dsa_param)
 
-            # create computation graph so that when compute the distance loss, can have the higher order derivative products
+                if args.distributed:
+                    forward_params = student_params[-1].unsqueeze(0).expand(torch.cuda.device_count(), -1)
+                else:
+                    forward_params = student_params[-1]
+                    
+                # train student net
+                output = student_net(x, flat_param=forward_params)
+                ce_loss = criterion(output, y)
+                # print(f'ce_loss:{ce_loss}')
+                ce_loss_total += ce_loss
+
+            # only the last step need to create the graph
             if step == args.syn_steps-1:
-                grad = torch.autograd.grad(ce_loss, student_params[-1], create_graph=True)[0]
+                grad = torch.autograd.grad(ce_loss_total, student_params[-1], create_graph=True)[0]
             else:
-                grad = torch.autograd.grad(ce_loss, student_params[-1])[0]
+                grad = torch.autograd.grad(ce_loss_total, student_params[-1])[0]
 
             # optimize the student net weights
             student_params.append(student_params[-1] - syn_lr * grad)
             
-
+            
+        ''' calculate the matching loss D and update the unet and lr '''
         param_loss = torch.tensor(0.0).to(args.device)
         param_dist = torch.tensor(0.0).to(args.device)
 
@@ -403,105 +459,34 @@ def main(args):
         param_loss_list.append(param_loss)
         param_dist_list.append(param_dist)
 
-
-        # param_loss /= num_params
-        # param_dist /= num_params
-
-        param_loss /= (param_dist)
+        param_loss /= (param_dist + 0.1)
 
         grand_loss = param_loss
-
-        optimizer_img.zero_grad()
+        
+        optimizer_unet.zero_grad()
         optimizer_lr.zero_grad()
-
+        
         grand_loss.backward()
         
-        wandb.log({"Syn_Im_Gradient":torch.linalg.norm(syn_images.grad)},step=it)
-        torch.nn.utils.clip_grad_norm_(syn_images, 0.002)
-        wandb.log({"Syn_Im_Cliped_Gradient":torch.linalg.norm(syn_images.grad)},step=it)
-
-        optimizer_img.step()
-        optimizer_label.step()
+        torch.nn.utils.clip_grad_norm_(unet_image.parameters(), 1.)
+        
+        optimizer_unet.step()
         optimizer_lr.step()
-
-
-        wandb.log({"Grand_Loss": grand_loss.detach().cpu(),
-                   "Start_Epoch": start_epoch})
-
+        
+        image_syn = copy.deepcopy(syn_images.data)
+        
         for _ in student_params:
             del _
 
         if it%10 == 0:
             print('%s iter = %04d, loss = %.4f' % (get_time(), it, grand_loss.item()))
 
-    wandb.finish()
+            
+        
+            
+    
+    
+        
 
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Parameter Processing')
-
-    parser.add_argument('--dataset', type=str, default='CIFAR10', help='dataset')
-
-    parser.add_argument('--subset', type=str, default='imagenette', help='ImageNet subset. This only does anything when --dataset=ImageNet')
-
-    parser.add_argument('--model', type=str, default='ConvNet', help='model')
-
-    parser.add_argument('--ipc', type=int, default=10, help='image(s) per class')
-
-    parser.add_argument('--eval_mode', type=str, default='S',
-                        help='eval_mode, check utils.py for more info')
-
-    parser.add_argument('--num_eval', type=int, default=1, help='how many networks to evaluate on')
-
-    parser.add_argument('--eval_it', type=int, default=100, help='how often to evaluate')
-
-    parser.add_argument('--epoch_eval_train', type=int, default=1000, help='epochs to train a model with synthetic data')
-    parser.add_argument('--Iteration', type=int, default=5000, help='how many distillation steps to perform')
-
-    parser.add_argument('--lr_img', type=float, default=1000, help='learning rate for updating synthetic images')
-    parser.add_argument('--lr_lr', type=float, default=1e-05, help='learning rate for updating... learning rate')
-    parser.add_argument('--lr_teacher', type=float, default=0.01, help='initialization for synthetic learning rate')
-
-    parser.add_argument('--lr_init', type=float, default=0.01, help='how to init lr (alpha)')
-
-    parser.add_argument('--batch_real', type=int, default=256, help='batch size for real data')
-    parser.add_argument('--batch_syn', type=int, default=None, help='should only use this if you run out of VRAM')
-    parser.add_argument('--batch_train', type=int, default=256, help='batch size for training networks')
-
-    parser.add_argument('--pix_init', type=str, default='real', choices=["noise", "real"],
-                        help='noise/real: initialize synthetic images from random noise or randomly sampled real images.')
-
-    parser.add_argument('--dsa', type=str, default='True', choices=['True', 'False'],
-                        help='whether to use differentiable Siamese augmentation.')
-
-    parser.add_argument('--dsa_strategy', type=str, default='color_crop_cutout_flip_scale_rotate',
-                        help='differentiable Siamese augmentation strategy')
-
-    parser.add_argument('--data_path', type=str, default='data', help='dataset path')
-    parser.add_argument('--buffer_path', type=str, default='./buffer', help='buffer path')
-
-    parser.add_argument('--expert_epochs', type=int, default=3, help='how many expert epochs the target params are')
-    parser.add_argument('--syn_steps', type=int, default=20, help='how many steps to take on synthetic data')
-    parser.add_argument('--max_start_epoch', type=int, default=25, help='max epoch we can start at')
-
-    parser.add_argument('--zca', action='store_true', help="do ZCA whitening")
-
-    parser.add_argument('--load_all', action='store_true', help="only use if you can fit all expert trajectories into RAM")
-
-    parser.add_argument('--no_aug', type=bool, default=False, help='this turns off diff aug during distillation')
-
-    parser.add_argument('--texture', action='store_true', help="will distill textures instead")
-    parser.add_argument('--canvas_size', type=int, default=2, help='size of synthetic canvas')
-    parser.add_argument('--canvas_samples', type=int, default=1, help='number of canvas samples per iteration')
-
-
-    parser.add_argument('--max_files', type=int, default=None, help='number of expert files to read (leave as None unless doing ablations)')
-    parser.add_argument('--max_experts', type=int, default=None, help='number of experts to read per file (leave as None unless doing ablations)')
-
-    parser.add_argument('--force_save', action='store_true', help='this will save images for 50ipc')
-
-    args = parser.parse_args()
-
-    main(args)
-
-
+if __name__=="__main__":
+    main()
