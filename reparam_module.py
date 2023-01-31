@@ -144,6 +144,10 @@ class ReparamModule(nn.Module):
     def _forward_with_param(self, flat_param, *inputs, **kwinputs):
         with self.unflattened_param(flat_param):
             return self.module(*inputs, **kwinputs)
+        
+    def _feature_forward_with_param(self, flat_param, inputs):
+        with self.unflattened_param(flat_param):
+            return self.module.feature_forward(*inputs)
 
     def forward(self, *inputs, flat_param=None, buffers=None, **kwinputs):
         flat_param = torch.squeeze(flat_param)
@@ -157,3 +161,8 @@ class ReparamModule(nn.Module):
             return self._forward_with_param(flat_param, *inputs, **kwinputs)
         else:
             return self._forward_with_param_and_buffers(flat_param, tuple(buffers), *inputs, **kwinputs)
+        
+    def feature_forward(self, *inputs, flat_param=None):
+        if flat_param is None:
+            flat_param = self.flat_param
+        return self._feature_forward_with_param(flat_param, inputs)

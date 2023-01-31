@@ -1,5 +1,6 @@
 import os
 import argparse
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -33,7 +34,7 @@ def main(args):
     print("Device: ", args.device)
 
     eval_it_pool = np.arange(0, args.Iteration + 1, args.eval_it).tolist()
-    channel, im_size, num_classes, class_names, mean, std, dst_train, dst_test, testloader, loader_train_dict, class_map, class_map_inv = get_dataset(args.dataset, args.data_path, args.batch_real, args.subset, args=args)
+    channel, im_size, num_classes, class_names, mean, std, dst_train, dst_test, testloader, loader_train_dict, class_map, class_map_inv = get_dataset(args.dataset, args.data_path, args.batch_real, args=args)
     model_eval_pool = get_eval_pool(args.eval_mode, args.model, args.model)
 
     im_res = im_size[0]
@@ -110,7 +111,6 @@ def main(args):
 
     ''' initialize the synthetic data '''
     label_syn = torch.tensor([np.ones(args.ipc,dtype=np.int_)*i for i in range(num_classes)], dtype=torch.long, device=args.device).view(-1) # [0,0,0, 1,1,1, ..., 9,9,9]
-    label_syn_one_hot = F.one_hot(label_syn, num_classes).float().requires_grad_(True)
     
 
     if args.texture:
@@ -138,14 +138,12 @@ def main(args):
     ''' training '''
     image_syn = image_syn.detach().to(args.device).requires_grad_(True)
     syn_lr = syn_lr.detach().to(args.device).requires_grad_(True)
-    # optimizer_img_all_order = torch.optim.SGD([image_syn], lr=args.lr_img, momentum=0.5)
     optimizer_lr = torch.optim.SGD([syn_lr], lr=args.lr_lr, momentum=0.5)
     optimizer_img = torch.optim.SGD([image_syn], lr=args.lr_img, momentum=0.5)
-    # optimizer_label = torch.optim.SGD([label_syn_one_hot], lr=0.001, momentum=0.5)
-    optimizer_label = torch.optim.Adam([label_syn_one_hot], lr=0.001, weight_decay=0.0005)
+    
+    cosine_similarity = nn.CosineSimilarity(dim=1)
     
     optimizer_img.zero_grad()
-    optimizer_label.zero_grad()
 
     criterion = nn.CrossEntropyLoss().to(args.device)
     print('%s training begins'%get_time())
@@ -157,6 +155,34 @@ def main(args):
         expert_dir += "_NO_ZCA"
     expert_dir = os.path.join(expert_dir, args.model)
     print("Expert Dir: {}".format(expert_dir))
+    
+    def weightPerturb(network, alpha=1.0):
+        ''' perturb the initial weight using Gaussian distribution '''
+        # input: one epoch's training result
+        weight = []
+        for i in network:
+            d = torch.normal(mean=0,std=1,size=i.size())
+            Drop = nn.Dropout(p=0.5)
+            d_ = Drop(d)
+            d_F = torch.norm(d_)
+            d_ /= d_F
+            weight_perturb = i + alpha*d_*i
+            weight.append(weight_perturb)
+        return weight
+    
+    def weightDropout(network, p=0.1):
+        ''' randomly drop part of the network weight '''
+        # input: one epoch's training result
+        weight = []
+        layer_numbers = len(network)
+        drop_layer = random.randint(0, layer_numbers-1)
+        for i, layer in enumerate(network):
+            out = layer
+            if i == drop_layer:
+                Drop = nn.Dropout(p)
+                out = Drop(layer)
+            weight.append(out)
+        return weight
 
     if args.load_all:
         buffer = []
@@ -189,10 +215,12 @@ def main(args):
     best_acc = {m: 0 for m in model_eval_pool}
 
     best_std = {m: 0 for m in model_eval_pool}
+    
+    former = 0
 
     for it in range(0, args.Iteration+1):
         save_this_it = False
-
+            
         # writer.add_scalar('Progress', it, it)
         wandb.log({"Progress": it}, step=it)
         ''' Evaluate synthetic data '''
@@ -234,7 +262,6 @@ def main(args):
                 wandb.log({'Max_Accuracy/{}'.format(model_eval): best_acc[model_eval]}, step=it)
                 wandb.log({'Std/{}'.format(model_eval): acc_test_std}, step=it)
                 wandb.log({'Max_Std/{}'.format(model_eval): best_std[model_eval]}, step=it)
-                wandb.log({'label_syn/{}'.format(model_eval): label_syn_one_hot}, step=it)
 
 
         if it in eval_it_pool and (save_this_it or it % 1000 == 0):
@@ -249,11 +276,9 @@ def main(args):
                     os.makedirs(save_dir)
 
                 torch.save(image_save.cpu(), os.path.join(save_dir, "images_{}.pt".format(it)))
-                torch.save(label_syn.cpu(), os.path.join(save_dir, "labels_{}.pt".format(it)))
 
                 if save_this_it:
                     torch.save(image_save.cpu(), os.path.join(save_dir, "images_best.pt".format(it)))
-                    torch.save(label_syn.cpu(), os.path.join(save_dir, "labels_best.pt".format(it)))
 
                 wandb.log({"Pixels": wandb.Histogram(torch.nan_to_num(image_syn.detach().cpu()))}, step=it)
 
@@ -334,8 +359,19 @@ def main(args):
                     buffer = buffer[:args.max_experts]
                 random.shuffle(buffer)
 
+        def hierarchical_sample_expert(former, interval=10):
+            start_epoch = np.random.randint(0, args.max_start_epoch)
+            if np.abs(start_epoch-former) > interval:
+                small, large = max(former - interval, 0), min(former + interval, args.max_start_epoch)
+                start_epoch = np.random.randint(small, large)
+            return start_epoch
+        
+        # start_epoch = hierarchical_sample_expert(former)
         start_epoch = np.random.randint(0, args.max_start_epoch)
+        # start_epoch = 0
+        former = start_epoch
         starting_params = expert_trajectory[start_epoch]
+        starting_params = weightPerturb(starting_params, alpha=0.5)
 
         target_params = expert_trajectory[start_epoch+args.expert_epochs]
         target_params = torch.cat([p.data.to(args.device).reshape(-1) for p in target_params], 0)
@@ -346,12 +382,11 @@ def main(args):
 
         syn_images = image_syn
 
-        # y_hat = label_syn.to(args.device)
-        # print(f"syn label example: 0. {label_syn_one_hot[0]} \n 10. {label_syn_one_hot[10]} \n last. {label_syn_one_hot[-1]}")
-
         param_loss_list = []
         param_dist_list = []
         indices_chunks = []
+        
+        ce_loss_total = 0.0
 
         for step in range(args.syn_steps):
             # XXX: for debug
@@ -366,7 +401,7 @@ def main(args):
 
 
             x = syn_images[these_indices]
-            this_y = label_syn_one_hot[these_indices]
+            this_y = label_syn[these_indices]
 
             if args.texture:
                 x = torch.cat([torch.stack([torch.roll(im, (torch.randint(im_size[0]*args.canvas_size, (1,)), torch.randint(im_size[1]*args.canvas_size, (1,))), (1,2))[:,:im_size[0],:im_size[1]] for im in x]) for _ in range(args.canvas_samples)])
@@ -384,32 +419,90 @@ def main(args):
             x = student_net(x, flat_param=forward_params)
             ce_loss = criterion(x, this_y)
 
+            # adaptive ce_loss to balance loss between small and large start epoch
+            # if start_epoch >= args.max_start_epoch//2:
+            #     ce_loss *= math.log(start_epoch-args.max_start_epoch//2+8, 5)
+            # else:
+            #     ce_loss /= math.log(args.max_start_epoch//2-start_epoch+8, 5)
+
             # create computation graph so that when compute the distance loss, can have the higher order derivative products
-            if step == args.syn_steps-1:
-                grad = torch.autograd.grad(ce_loss, student_params[-1], create_graph=True)[0]
+            # if step >= args.syn_steps-8:
+            #     grad = torch.autograd.grad(ce_loss, student_params[-1], create_graph=True)[0]
+            # else:
+            #     grad = torch.autograd.grad(ce_loss, student_params[-1])[0]
+            grad = torch.autograd.grad(ce_loss, student_params[-1], create_graph=True)[0]
+
+            # optimize the student net weights, add momentum
+            if step == 0:
+                b_t1 = grad
+                g_t = b_t1
             else:
-                grad = torch.autograd.grad(ce_loss, student_params[-1])[0]
-
-            # optimize the student net weights
-            student_params.append(student_params[-1] - syn_lr * grad)
+                b_t = args.mom * b_t1 + grad
+                # no use nesterov
+                g_t  = b_t
+                b_t1 = b_t
+            student_params.append(student_params[-1] - syn_lr * g_t)
             
+            ce_loss_total += ce_loss
+            
+        ce_loss_total /= args.syn_steps
+        wandb.log({"celoss/Inner_loss":ce_loss_total}, step=it)
 
+        
+        # alignment loss
+
+        # if args.distributed:
+        #     forward_params = student_params[-1].unsqueeze(0).expand(torch.cuda.device_count(), -1)
+        # else:
+        #     forward_params = student_params[-1]
+        # feas_syn = student_net.module.feature_forward(syn_images, flat_param=forward_params)
+        
+        # if args.distributed:
+        #     forward_params = target_params.unsqueeze(0).expand(torch.cuda.device_count(), -1)
+        # else:
+        forward_params = student_params[-1].clone().detach()
+        
+        sum_align_loss = torch.tensor(0.0).to(args.device)
+        for c in range(num_classes):
+            # get images of each label
+            batch_syn = syn_images[c*args.ipc:(c+1)*args.ipc]
+            feas_syn = student_net.module.feature_forward(batch_syn, flat_param=forward_params)
+            
+            batch_img = get_images(c, args.align_bs).detach().to(args.device)
+            batch_label = torch.ones(args.align_bs, dtype=torch.long)*c
+            feas_real = student_net.module.feature_forward(batch_img, flat_param=forward_params)
+            
+            # align the feature
+            for layer in range(len(feas_syn)):
+                out = torch.mean(feas_syn[layer], dim=0)
+                target = torch.mean(feas_real[layer], dim=0)
+                loss = torch.nn.functional.mse_loss(out, target)
+                sum_align_loss += loss
+        
+        # print(sum_align_loss)
+        # break
+        wandb.log({"align_loss":sum_align_loss}, step=it)
+        
+        
         param_loss = torch.tensor(0.0).to(args.device)
         param_dist = torch.tensor(0.0).to(args.device)
 
         param_loss += torch.nn.functional.mse_loss(student_params[-1], target_params, reduction="sum")
         param_dist += torch.nn.functional.mse_loss(starting_params, target_params, reduction="sum")
+        
 
         param_loss_list.append(param_loss)
         param_dist_list.append(param_dist)
 
-
         # param_loss /= num_params
         # param_dist /= num_params
+        
+        wandb.log({"param_loss":param_loss, "param_dist":param_dist}, step=it)
 
         param_loss /= (param_dist)
-
-        grand_loss = param_loss
+        
+        grand_loss = param_loss + 0.1* sum_align_loss
+        # grand_loss = param_loss
 
         optimizer_img.zero_grad()
         optimizer_lr.zero_grad()
@@ -417,16 +510,16 @@ def main(args):
         grand_loss.backward()
         
         wandb.log({"Syn_Im_Gradient":torch.linalg.norm(syn_images.grad)},step=it)
-        torch.nn.utils.clip_grad_norm_(syn_images, 0.002)
-        wandb.log({"Syn_Im_Cliped_Gradient":torch.linalg.norm(syn_images.grad)},step=it)
 
         optimizer_img.step()
-        optimizer_label.step()
         optimizer_lr.step()
 
 
         wandb.log({"Grand_Loss": grand_loss.detach().cpu(),
                    "Start_Epoch": start_epoch})
+
+        if it == args.Iteration//2:
+            optimizer_img = torch.optim.SGD([image_syn], lr=args.lr_img*0.5, momentum=0.5)
 
         for _ in student_params:
             del _
@@ -447,13 +540,14 @@ if __name__ == '__main__':
     parser.add_argument('--model', type=str, default='ConvNet', help='model')
 
     parser.add_argument('--ipc', type=int, default=10, help='image(s) per class')
+    parser.add_argument('--align_bs', type=int, default=512, help='real images per class for the alignment loss')
 
     parser.add_argument('--eval_mode', type=str, default='S',
                         help='eval_mode, check utils.py for more info')
 
     parser.add_argument('--num_eval', type=int, default=1, help='how many networks to evaluate on')
 
-    parser.add_argument('--eval_it', type=int, default=100, help='how often to evaluate')
+    parser.add_argument('--eval_it', type=int, default=200, help='how often to evaluate')
 
     parser.add_argument('--epoch_eval_train', type=int, default=1000, help='epochs to train a model with synthetic data')
     parser.add_argument('--Iteration', type=int, default=5000, help='how many distillation steps to perform')
@@ -461,6 +555,8 @@ if __name__ == '__main__':
     parser.add_argument('--lr_img', type=float, default=1000, help='learning rate for updating synthetic images')
     parser.add_argument('--lr_lr', type=float, default=1e-05, help='learning rate for updating... learning rate')
     parser.add_argument('--lr_teacher', type=float, default=0.01, help='initialization for synthetic learning rate')
+    parser.add_argument('--lr_label', type=float, default=0.001, help='initialization for learnable label learning rate')
+    parser.add_argument('--mom', type=float, default=0.9, help='momentum for update the inner neural network')
 
     parser.add_argument('--lr_init', type=float, default=0.01, help='how to init lr (alpha)')
 

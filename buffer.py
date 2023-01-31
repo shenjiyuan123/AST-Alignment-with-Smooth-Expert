@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 from utils import get_dataset, get_network, get_daparam,\
-    TensorDataset, epoch, ParamDiffAug
+    TensorDataset, epoch, epoch_flat, ParamDiffAug
 import copy
 
 import warnings
@@ -78,21 +78,27 @@ def main(args):
         timestamps.append([p.detach().cpu() for p in teacher_net.parameters()])
 
         lr_schedule = [args.train_epochs // 2 + 1]
+        
+        loss_decay = [0.5,0.5,0.55,0.55,0.6,0.65,0.7,0.75,0.8,0.85,0.9]
 
         for e in range(args.train_epochs):
-
-            train_loss, train_acc = epoch("train", dataloader=trainloader, net=teacher_net, optimizer=teacher_optim,
+            if e<len(loss_decay):
+                train_loss, train_acc = epoch_flat("train", loss_decay=loss_decay[e], dataloader=trainloader, net=teacher_net, optimizer=teacher_optim,
+                                        criterion=criterion, args=args, aug=True)
+                print("epoch flat")
+            else:
+                train_loss, train_acc = epoch("train", dataloader=trainloader, net=teacher_net, optimizer=teacher_optim,
                                         criterion=criterion, args=args, aug=True)
 
             test_loss, test_acc = epoch("test", dataloader=testloader, net=teacher_net, optimizer=None,
                                         criterion=criterion, args=args, aug=False)
 
-            print("Itr: {}\tEpoch: {}\tTrain Acc: {}\tTest Acc: {}".format(it, e, train_acc, test_acc))
+            print("Itr: {}\tEpoch: {}\tLR {}\tTrain Acc: {}\tTest Acc: {}".format(it, e, lr, train_acc, test_acc))
 
             timestamps.append([p.detach().cpu() for p in teacher_net.parameters()])
 
-            if e in lr_schedule and args.decay:
-                lr *= 0.1
+            if e in lr_schedule:
+                lr *= 0.7
                 teacher_optim = torch.optim.SGD(teacher_net.parameters(), lr=lr, momentum=args.mom, weight_decay=args.l2)
                 teacher_optim.zero_grad()
 
@@ -113,7 +119,7 @@ if __name__ == '__main__':
     parser.add_argument('--subset', type=str, default='imagenette', help='subset')
     parser.add_argument('--model', type=str, default='ConvNet', help='model')
     parser.add_argument('--num_experts', type=int, default=100, help='training iterations')
-    parser.add_argument('--lr_teacher', type=float, default=0.01, help='learning rate for updating network parameters')
+    parser.add_argument('--lr_teacher', type=float, default=0.003, help='learning rate for updating network parameters')
     parser.add_argument('--batch_train', type=int, default=256, help='batch size for training networks')
     parser.add_argument('--batch_real', type=int, default=256, help='batch size for real loader')
     parser.add_argument('--dsa', type=str, default='True', choices=['True', 'False'],
@@ -125,9 +131,9 @@ if __name__ == '__main__':
     parser.add_argument('--train_epochs', type=int, default=50)
     parser.add_argument('--zca', action='store_true')
     parser.add_argument('--decay', action='store_true')
-    parser.add_argument('--mom', type=float, default=0, help='momentum')
-    parser.add_argument('--l2', type=float, default=0, help='l2 regularization')
-    parser.add_argument('--save_interval', type=int, default=10)
+    parser.add_argument('--mom', type=float, default=0.9, help='momentum')
+    parser.add_argument('--l2', type=float, default=0.001, help='l2 regularization')
+    parser.add_argument('--save_interval', type=int, default=5)
 
     args = parser.parse_args()
     main(args)

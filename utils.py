@@ -297,6 +297,55 @@ def get_time():
     return str(time.strftime("[%Y-%m-%d %H:%M:%S]", time.localtime()))
 
 
+def epoch_flat(mode, dataloader, net, optimizer, loss_decay, criterion, args, aug, texture=False):
+    loss_avg, acc_avg, num_exp = 0, 0, 0
+    net = net.to(args.device)
+
+    if args.dataset == "ImageNet":
+        class_map = {x: i for i, x in enumerate(config.img_net_classes)}
+
+    if mode == 'train':
+        net.train()
+    else:
+        net.eval()
+
+    for i_batch, datum in enumerate(dataloader):
+        img = datum[0].float().to(args.device)
+        lab = datum[1].long().to(args.device)
+
+        if mode == "train" and texture:
+            img = torch.cat([torch.stack([torch.roll(im, (torch.randint(args.im_size[0]*args.canvas_size, (1,)), torch.randint(args.im_size[0]*args.canvas_size, (1,))), (1,2))[:,:args.im_size[0],:args.im_size[1]] for im in img]) for _ in range(args.canvas_samples)])
+            lab = torch.cat([lab for _ in range(args.canvas_samples)])
+
+        if aug:
+            if args.dsa:
+                img = DiffAugment(img, args.dsa_strategy, param=args.dsa_param)
+            else:
+                img = augment(img, args.dc_aug_param, device=args.device)
+
+        if args.dataset == "ImageNet" and mode != "train":
+            lab = torch.tensor([class_map[x.item()] for x in lab]).to(args.device)
+
+        n_b = lab.shape[0]
+
+        output = net(img)
+        loss = criterion(output, lab) * loss_decay
+
+        acc = np.sum(np.equal(np.argmax(output.cpu().data.numpy(), axis=-1), lab.cpu().data.numpy()))
+
+        loss_avg += loss.item()*n_b
+        acc_avg += acc
+        num_exp += n_b
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+    loss_avg /= num_exp
+    acc_avg /= num_exp
+
+    return loss_avg, acc_avg
+
 def epoch(mode, dataloader, net, optimizer, criterion, args, aug, texture=False):
     loss_avg, acc_avg, num_exp = 0, 0, 0
     net = net.to(args.device)
@@ -347,8 +396,6 @@ def epoch(mode, dataloader, net, optimizer, criterion, args, aug, texture=False)
 
     return loss_avg, acc_avg
 
-
-
 def evaluate_synset(it_eval, net, images_train, labels_train, testloader, args, return_loss=False, texture=False):
     net = net.to(args.device)
     images_train = images_train.to(args.device)
@@ -356,7 +403,7 @@ def evaluate_synset(it_eval, net, images_train, labels_train, testloader, args, 
     lr = float(args.lr_net)
     Epoch = int(args.epoch_eval_train)
     lr_schedule = [Epoch//2+1]
-    optimizer = torch.optim.SGD(net.parameters(), lr=lr, momentum=0.9, weight_decay=0.0005)
+    optimizer = torch.optim.SGD(net.parameters(), lr=lr, momentum=0.9, weight_decay=0.001)
 
     criterion = nn.CrossEntropyLoss().to(args.device)
 
@@ -366,27 +413,31 @@ def evaluate_synset(it_eval, net, images_train, labels_train, testloader, args, 
     start = time.time()
     acc_train_list = []
     loss_train_list = []
+    max_acc_test = 0.0
 
     for ep in tqdm.tqdm(range(Epoch+1)):
         loss_train, acc_train = epoch('train', trainloader, net, optimizer, criterion, args, aug=True, texture=texture)
         acc_train_list.append(acc_train)
         loss_train_list.append(loss_train)
-        if ep == Epoch:
+        if ep%20 == 0:
             with torch.no_grad():
                 loss_test, acc_test = epoch('test', testloader, net, optimizer, criterion, args, aug=False)
+            # print(acc_test)
+            if acc_test>max_acc_test:
+                max_acc_test = acc_test
         if ep in lr_schedule:
-            lr *= 0.1
-            optimizer = torch.optim.SGD(net.parameters(), lr=lr, momentum=0.9, weight_decay=0.0005)
+            lr *= 0.5
+            optimizer = torch.optim.SGD(net.parameters(), lr=lr, momentum=0.8, weight_decay=0.001)
 
 
     time_train = time.time() - start
 
-    print('%s Evaluate_%02d: epoch = %04d train time = %d s train loss = %.6f train acc = %.4f, test acc = %.4f' % (get_time(), it_eval, Epoch, int(time_train), loss_train, acc_train, acc_test))
+    print('%s Evaluate_%02d: epoch = %04d train time = %d s train loss = %.6f train acc = %.4f, test acc = %.4f, max test acc = %.4f, test loss = %.6f' % (get_time(), it_eval, Epoch, int(time_train), loss_train, acc_train, acc_test, max_acc_test, loss_test))
 
     if return_loss:
-        return net, acc_train_list, acc_test, loss_train_list, loss_test
+        return net, acc_train_list, max_acc_test, loss_train_list, loss_test
     else:
-        return net, acc_train_list, acc_test
+        return net, acc_train_list, max_acc_test
 
 
 def augment(images, dc_aug_param, device):

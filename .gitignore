@@ -2,6 +2,13 @@
 __pycache__
 .vscode
 buffer
+buffer_adam
+buffer_flat1
+buffer_flat2
+buffer_instancenorm
+buffer_sgdmom
+buffer_testlr
+buffer_cifa10_flat
 data
 logged_files
 outs

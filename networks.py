@@ -33,6 +33,17 @@ class ConvNet(nn.Module):
         self.features, shape_feat = self._make_layers(channel, net_width, net_depth, net_norm, net_act, net_pooling, im_size)
         num_feat = shape_feat[0]*shape_feat[1]*shape_feat[2]
         self.classifier = nn.Linear(num_feat, num_classes)
+        
+    def feature_forward(self, x, compress=True):
+        fea_all = []
+        for i in range(len(self.features)):
+            fea = self.features[i](x)
+            if isinstance(self.features[i], nn.ReLU):
+                fea_all.append(fea)
+                
+            x = fea
+            
+        return fea_all
 
     def forward(self, x):
         # print("MODEL DATA ON: ", x.get_device(), "MODEL PARAMS ON: ", self.classifier.weight.data.get_device())
