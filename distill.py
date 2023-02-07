@@ -161,9 +161,9 @@ def main(args):
         # input: one epoch's training result
         weight = []
         for i in network:
-            d = torch.normal(mean=0,std=1,size=i.size())
-            Drop = nn.Dropout(p=0.5)
-            d_ = Drop(d)
+            d_ = torch.normal(mean=0,std=1,size=i.size())
+            # Drop = nn.Dropout(p=0.0)
+            # d_ = Drop(d)
             d_F = torch.norm(d_)
             d_ /= d_F
             weight_perturb = i + alpha*d_*i
@@ -371,7 +371,7 @@ def main(args):
         # start_epoch = 0
         former = start_epoch
         starting_params = expert_trajectory[start_epoch]
-        starting_params = weightPerturb(starting_params, alpha=0.5)
+        starting_params = weightPerturb(starting_params, alpha=1)
 
         target_params = expert_trajectory[start_epoch+args.expert_epochs]
         target_params = torch.cat([p.data.to(args.device).reshape(-1) for p in target_params], 0)
@@ -420,17 +420,20 @@ def main(args):
             ce_loss = criterion(x, this_y)
 
             # adaptive ce_loss to balance loss between small and large start epoch
-            # if start_epoch >= args.max_start_epoch//2:
-            #     ce_loss *= math.log(start_epoch-args.max_start_epoch//2+8, 5)
-            # else:
-            #     ce_loss /= math.log(args.max_start_epoch//2-start_epoch+8, 5)
+            if args.balance_loss:
+                if start_epoch >= args.max_start_epoch//2:
+                    ce_loss *= math.log(start_epoch-args.max_start_epoch//2+8, 5)
+                else:
+                    ce_loss /= math.log(args.max_start_epoch//2-start_epoch+8, 5)
 
             # create computation graph so that when compute the distance loss, can have the higher order derivative products
-            # if step >= args.syn_steps-8:
-            #     grad = torch.autograd.grad(ce_loss, student_params[-1], create_graph=True)[0]
-            # else:
-            #     grad = torch.autograd.grad(ce_loss, student_params[-1])[0]
-            grad = torch.autograd.grad(ce_loss, student_params[-1], create_graph=True)[0]
+            if args.ignore_graph:
+                if step >= args.syn_steps-8:
+                    grad = torch.autograd.grad(ce_loss, student_params[-1], create_graph=True)[0]
+                else:
+                    grad = torch.autograd.grad(ce_loss, student_params[-1])[0]
+            else:
+                grad = torch.autograd.grad(ce_loss, student_params[-1], create_graph=True)[0]
 
             # optimize the student net weights, add momentum
             if step == 0:
@@ -450,38 +453,30 @@ def main(args):
 
         
         # alignment loss
-
-        # if args.distributed:
-        #     forward_params = student_params[-1].unsqueeze(0).expand(torch.cuda.device_count(), -1)
-        # else:
-        #     forward_params = student_params[-1]
-        # feas_syn = student_net.module.feature_forward(syn_images, flat_param=forward_params)
-        
-        # if args.distributed:
-        #     forward_params = target_params.unsqueeze(0).expand(torch.cuda.device_count(), -1)
-        # else:
-        forward_params = student_params[-1].clone().detach()
-        
-        sum_align_loss = torch.tensor(0.0).to(args.device)
-        for c in range(num_classes):
-            # get images of each label
-            batch_syn = syn_images[c*args.ipc:(c+1)*args.ipc]
-            feas_syn = student_net.module.feature_forward(batch_syn, flat_param=forward_params)
+        if args.align_loss:
+            forward_params = student_params[-1].clone().detach()
+            expert_params  = target_params
             
-            batch_img = get_images(c, args.align_bs).detach().to(args.device)
-            batch_label = torch.ones(args.align_bs, dtype=torch.long)*c
-            feas_real = student_net.module.feature_forward(batch_img, flat_param=forward_params)
+            sum_align_loss = torch.tensor(0.0).to(args.device)
+            for c in range(num_classes):
+                # get images of each label
+                batch_syn = syn_images[c*args.ipc:(c+1)*args.ipc]
+                feas_syn = student_net.module.feature_forward(batch_syn, flat_param=forward_params)
+                
+                batch_img = get_images(c, args.align_bs).detach().to(args.device)
+                batch_label = torch.ones(args.align_bs, dtype=torch.long)*c
+                feas_real = student_net.module.feature_forward(batch_img, flat_param=expert_params)
+                
+                # align the feature
+                for layer in range(len(feas_syn)):
+                    out = torch.mean(feas_syn[layer], dim=0)
+                    target = torch.mean(feas_real[layer], dim=0)
+                    loss = torch.nn.functional.mse_loss(out, target)
+                    sum_align_loss += loss
             
-            # align the feature
-            for layer in range(len(feas_syn)):
-                out = torch.mean(feas_syn[layer], dim=0)
-                target = torch.mean(feas_real[layer], dim=0)
-                loss = torch.nn.functional.mse_loss(out, target)
-                sum_align_loss += loss
-        
-        # print(sum_align_loss)
-        # break
-        wandb.log({"align_loss":sum_align_loss}, step=it)
+            # print(sum_align_loss)
+            # break
+            wandb.log({"align_loss":sum_align_loss}, step=it)
         
         
         param_loss = torch.tensor(0.0).to(args.device)
@@ -501,8 +496,10 @@ def main(args):
 
         param_loss /= (param_dist)
         
-        grand_loss = param_loss + 0.1* sum_align_loss
-        # grand_loss = param_loss
+        if args.align_loss:
+            grand_loss = param_loss + args.align_alpha* sum_align_loss
+        else:
+            grand_loss = param_loss
 
         optimizer_img.zero_grad()
         optimizer_lr.zero_grad()
@@ -518,8 +515,8 @@ def main(args):
         wandb.log({"Grand_Loss": grand_loss.detach().cpu(),
                    "Start_Epoch": start_epoch})
 
-        if it == args.Iteration//2:
-            optimizer_img = torch.optim.SGD([image_syn], lr=args.lr_img*0.5, momentum=0.5)
+        # if it == args.Iteration//2:
+        #     optimizer_img = torch.optim.SGD([image_syn], lr=args.lr_img*0.5, momentum=0.5)
 
         for _ in student_params:
             del _
@@ -540,7 +537,9 @@ if __name__ == '__main__':
     parser.add_argument('--model', type=str, default='ConvNet', help='model')
 
     parser.add_argument('--ipc', type=int, default=10, help='image(s) per class')
-    parser.add_argument('--align_bs', type=int, default=512, help='real images per class for the alignment loss')
+    parser.add_argument('--align_loss', action='store_true', help='whether use alignment loss')
+    parser.add_argument('--align_alpha', type=float, default=0.1, help='the hyper-parameters for both loss')
+    parser.add_argument('--align_bs', type=int, default=500, help='real images per class for the alignment loss, e.g. each class has 500 images for cifa100')
 
     parser.add_argument('--eval_mode', type=str, default='S',
                         help='eval_mode, check utils.py for more info')
@@ -555,8 +554,9 @@ if __name__ == '__main__':
     parser.add_argument('--lr_img', type=float, default=1000, help='learning rate for updating synthetic images')
     parser.add_argument('--lr_lr', type=float, default=1e-05, help='learning rate for updating... learning rate')
     parser.add_argument('--lr_teacher', type=float, default=0.01, help='initialization for synthetic learning rate')
-    parser.add_argument('--lr_label', type=float, default=0.001, help='initialization for learnable label learning rate')
     parser.add_argument('--mom', type=float, default=0.9, help='momentum for update the inner neural network')
+    parser.add_argument('--balance_loss', action='store_true', help="do balance celoss")
+    parser.add_argument('--ignore_graph', action='store_true', help="ignore some parts of the computation graph")
 
     parser.add_argument('--lr_init', type=float, default=0.01, help='how to init lr (alpha)')
 
