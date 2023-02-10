@@ -23,6 +23,7 @@ def parse_args():
     parser.add_argument('--zca', action='store_true', help="do ZCA whitening")
     parser.add_argument('--ipc', type=int, default=10)
     parser.add_argument('--lr_net', type=float, default=0.06)
+    parser.add_argument('--num_classes', type=int, default=100)
     args = parser.parse_args()
     return args
 
@@ -30,7 +31,7 @@ def main(args):
     img = torch.load(args.img_pth)
     
     im_size = tuple(img.size()[-2:])
-    num_classes = 100
+    num_classes = args.num_classes
     args.dsa_param = ParamDiffAug()
     args.dc_aug_param = None
     args.num_eval = 3

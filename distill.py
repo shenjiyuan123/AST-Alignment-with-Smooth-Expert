@@ -371,7 +371,8 @@ def main(args):
         # start_epoch = 0
         former = start_epoch
         starting_params = expert_trajectory[start_epoch]
-        starting_params = weightPerturb(starting_params, alpha=1)
+        if args.weight_perturb:
+            starting_params = weightPerturb(starting_params, alpha=1)
 
         target_params = expert_trajectory[start_epoch+args.expert_epochs]
         target_params = torch.cat([p.data.to(args.device).reshape(-1) for p in target_params], 0)
@@ -387,6 +388,18 @@ def main(args):
         indices_chunks = []
         
         ce_loss_total = 0.0
+        
+        student_to_target = {}
+        match_pool = []
+        middle_params = []
+        middle_loss = []
+        for i in range(args.expert_epochs-1):
+            middle = (args.syn_steps//args.expert_epochs)*(i+1)
+            student_to_target[i+1] = middle
+            middle_params.append(torch.cat([p.data.to(args.device).reshape(-1) for p in expert_trajectory[start_epoch+middle]], 0))
+            match_pool.append(middle)
+        student_to_target[args.expert_epochs] = args.syn_steps
+        match_pool.append(args.syn_steps)
 
         for step in range(args.syn_steps):
             # XXX: for debug
@@ -448,6 +461,13 @@ def main(args):
             
             ce_loss_total += ce_loss
             
+            if step+1 in match_pool and step<args.syn_steps-1 and (args.agg_middle_loss or args.adaptive_middle_loss):
+                middle_target_params = middle_params.pop(0)
+                param_middle_loss = torch.nn.functional.mse_loss(student_params[-1], middle_target_params, reduction="sum")
+                param_middle_dist = torch.nn.functional.mse_loss(starting_params, middle_target_params, reduction="sum")
+                param_middle_loss /= (param_middle_dist)
+                middle_loss.append(param_middle_loss)
+                
         ce_loss_total /= args.syn_steps
         wandb.log({"celoss/Inner_loss":ce_loss_total}, step=it)
 
@@ -484,7 +504,7 @@ def main(args):
 
         param_loss += torch.nn.functional.mse_loss(student_params[-1], target_params, reduction="sum")
         param_dist += torch.nn.functional.mse_loss(starting_params, target_params, reduction="sum")
-        
+
 
         param_loss_list.append(param_loss)
         param_dist_list.append(param_dist)
@@ -496,10 +516,17 @@ def main(args):
 
         param_loss /= (param_dist)
         
+        grand_loss = param_loss
         if args.align_loss:
-            grand_loss = param_loss + args.align_alpha* sum_align_loss
-        else:
-            grand_loss = param_loss
+            grand_loss += args.align_alpha* sum_align_loss
+        if args.adaptive_middle_loss:
+            for num, tmp in enumerate(middle_loss):
+                beta = (1/(1+len(middle_loss)))*(num+1)
+                grand_loss += beta* tmp
+        elif args.agg_middle_loss:
+            for num, tmp in enumerate(middle_loss):
+                beta = 1
+                grand_loss += beta* tmp
 
         optimizer_img.zero_grad()
         optimizer_lr.zero_grad()
@@ -556,7 +583,10 @@ if __name__ == '__main__':
     parser.add_argument('--lr_teacher', type=float, default=0.01, help='initialization for synthetic learning rate')
     parser.add_argument('--mom', type=float, default=0.9, help='momentum for update the inner neural network')
     parser.add_argument('--balance_loss', action='store_true', help="do balance celoss")
+    parser.add_argument('--agg_middle_loss', action='store_true', help="whether match the student with the expert in the middle of syn_step")
+    parser.add_argument('--adaptive_middle_loss', action='store_true', help="adaptive match the student with the expert in the middle of syn_step")
     parser.add_argument('--ignore_graph', action='store_true', help="ignore some parts of the computation graph")
+    parser.add_argument('--weight_perturb', action='store_true', help="perturb the starting model parameters")
 
     parser.add_argument('--lr_init', type=float, default=0.01, help='how to init lr (alpha)')
 
