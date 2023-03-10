@@ -346,6 +346,70 @@ def epoch_flat(mode, dataloader, net, optimizer, loss_decay, criterion, args, au
 
     return loss_avg, acc_avg
 
+def epoch_gp(mode, loss_decay, dataloader, net, optimizer, criterion, args, aug, texture=False, LAMBDA=0.1):
+    loss_avg, acc_avg, num_exp = 0, 0, 0
+    net = net.to(args.device)
+
+    if args.dataset == "ImageNet":
+        class_map = {x: i for i, x in enumerate(config.img_net_classes)}
+
+    if mode == 'train':
+        net.train()
+    else:
+        net.eval()
+
+    for i_batch, datum in enumerate(dataloader):
+        img = datum[0].float().to(args.device)
+        img_gp = img.clone().detach().requires_grad_(True)
+        
+        lab = datum[1].long().to(args.device)
+        
+        if mode == "train" and texture:
+            img = torch.cat([torch.stack([torch.roll(im, (torch.randint(args.im_size[0]*args.canvas_size, (1,)), torch.randint(args.im_size[0]*args.canvas_size, (1,))), (1,2))[:,:args.im_size[0],:args.im_size[1]] for im in img]) for _ in range(args.canvas_samples)])
+            lab = torch.cat([lab for _ in range(args.canvas_samples)])
+
+        if aug:
+            if args.dsa:
+                img = DiffAugment(img, args.dsa_strategy, param=args.dsa_param)
+            else:
+                img = augment(img, args.dc_aug_param, device=args.device)
+
+        if args.dataset == "ImageNet" and mode != "train":
+            lab = torch.tensor([class_map[x.item()] for x in lab]).to(args.device)
+
+        n_b = lab.shape[0]
+
+        output = net(img)
+        loss = criterion(output, lab) * loss_decay
+        
+        
+        # add the gradient penalty to the final loss
+        img_gp = img_gp.requires_grad_(True)
+        out_gp = net(img_gp)
+        gradients = torch.autograd.grad(out_gp, img_gp, 
+                                        grad_outputs=torch.ones(output.size()).cuda(),
+                                        create_graph=True)[0]
+        
+        gradient_penalty = ((torch.norm(gradients, p=2, dim=1)-1) ** 2).mean() * LAMBDA
+        
+        loss += gradient_penalty
+        
+        if mode=='train':
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        acc = np.sum(np.equal(np.argmax(output.cpu().data.numpy(), axis=-1), lab.cpu().data.numpy()))
+
+        loss_avg += loss.item()*n_b
+        acc_avg += acc
+        num_exp += n_b
+
+    loss_avg /= num_exp
+    acc_avg /= num_exp
+
+    return loss_avg, acc_avg
+
 def epoch(mode, dataloader, net, optimizer, criterion, args, aug, texture=False):
     loss_avg, acc_avg, num_exp = 0, 0, 0
     net = net.to(args.device)

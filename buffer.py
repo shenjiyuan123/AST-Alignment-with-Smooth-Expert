@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 from utils import get_dataset, get_network, get_daparam,\
-    TensorDataset, epoch, epoch_flat, ParamDiffAug
+    TensorDataset, epoch, epoch_flat, epoch_gp, ParamDiffAug
 import copy
 
 import warnings
@@ -79,26 +79,36 @@ def main(args):
 
         lr_schedule = [args.train_epochs // 2 + 1]
         
-        loss_decay = [0.5,0.5,0.55,0.55,0.6,0.65,0.7,0.75,0.8,0.85,0.9]
+        loss_decay = [0.5,0.6,0.7,0.8,0.9]
 
         for e in range(args.train_epochs):
-            if e<len(loss_decay):
-                train_loss, train_acc = epoch_flat("train", loss_decay=loss_decay[e], dataloader=trainloader, net=teacher_net, optimizer=teacher_optim,
-                                        criterion=criterion, args=args, aug=True)
-                print("epoch flat")
+            if args.gp=='False':
+                if e<len(loss_decay):
+                    train_loss, train_acc = epoch_flat("train", loss_decay=loss_decay[e], dataloader=trainloader, net=teacher_net, optimizer=teacher_optim,
+                                            criterion=criterion, args=args, aug=True)
+                    print("epoch flat")
+                else:
+                    train_loss, train_acc = epoch("train", dataloader=trainloader, net=teacher_net, optimizer=teacher_optim,
+                                            criterion=criterion, args=args, aug=True)
             else:
-                train_loss, train_acc = epoch("train", dataloader=trainloader, net=teacher_net, optimizer=teacher_optim,
-                                        criterion=criterion, args=args, aug=True)
+                if e<len(loss_decay):
+                    train_loss, train_acc = epoch_gp("train", loss_decay=loss_decay[e], dataloader=trainloader, net=teacher_net, optimizer=teacher_optim,
+                                            criterion=criterion, args=args, aug=True)
+                    print("epoch flat")
+                else: 
+                    train_loss, train_acc = epoch_gp("train", loss_decay=1, dataloader=trainloader, net=teacher_net, optimizer=teacher_optim,
+                                            criterion=criterion, args=args, aug=True)
+                
 
             test_loss, test_acc = epoch("test", dataloader=testloader, net=teacher_net, optimizer=None,
                                         criterion=criterion, args=args, aug=False)
 
-            print("Itr: {}\tEpoch: {}\tLR {}\tTrain Acc: {}\tTest Acc: {}".format(it, e, lr, train_acc, test_acc))
+            print("Itr: {}\tEpoch: {}\tLR {}\tTrain Acc: {}\tTest Acc: {},\tTrain Loss: {},\tTest Loss: {}".format(it, e, lr, train_acc, test_acc, train_loss, test_loss))
 
             timestamps.append([p.detach().cpu() for p in teacher_net.parameters()])
 
             if e in lr_schedule:
-                lr *= 0.7
+                lr *= 0.6
                 teacher_optim = torch.optim.SGD(teacher_net.parameters(), lr=lr, momentum=args.mom, weight_decay=args.l2)
                 teacher_optim.zero_grad()
 
@@ -119,7 +129,7 @@ if __name__ == '__main__':
     parser.add_argument('--subset', type=str, default='imagenette', help='subset')
     parser.add_argument('--model', type=str, default='ConvNet', help='model')
     parser.add_argument('--num_experts', type=int, default=100, help='training iterations')
-    parser.add_argument('--lr_teacher', type=float, default=0.003, help='learning rate for updating network parameters')
+    parser.add_argument('--lr_teacher', type=float, default=0.004, help='learning rate for updating network parameters')
     parser.add_argument('--batch_train', type=int, default=256, help='batch size for training networks')
     parser.add_argument('--batch_real', type=int, default=256, help='batch size for real loader')
     parser.add_argument('--dsa', type=str, default='True', choices=['True', 'False'],
@@ -133,6 +143,7 @@ if __name__ == '__main__':
     parser.add_argument('--decay', action='store_true')
     parser.add_argument('--mom', type=float, default=0.9, help='momentum')
     parser.add_argument('--l2', type=float, default=0.001, help='l2 regularization')
+    parser.add_argument('--gp', type=str, default='False', choices=['True', 'False'], help='gradient penalty')
     parser.add_argument('--save_interval', type=int, default=5)
 
     args = parser.parse_args()

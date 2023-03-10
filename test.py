@@ -33,17 +33,18 @@ def main(args):
     im_size = tuple(img.size()[-2:])
     num_classes = args.num_classes
     args.dsa_param = ParamDiffAug()
+    args.dsa = True if args.dsa=='True' else False
     args.dc_aug_param = None
     args.num_eval = 3
     args.device = 'cuda' if torch.cuda.is_available() else 'cpu'
     args.epoch_eval_train = 1500
-    args.batch_train = 256
+    args.batch_train = 512
     args.im_size = im_size
     args.model = 'ConvNet'
     
     label = torch.tensor(np.array([np.ones(args.ipc,dtype=np.int_)*i for i in range(num_classes)]), dtype=torch.long).view(-1) # [0,0,0, 1,1,1, ..., 9,9,9]
 
-    print(args.__dict__)
+    print("Hyper parameters: ", args.__dict__)
     
     wandb.init(sync_tensorboard=False,
             project="Distilled_Image_Test",

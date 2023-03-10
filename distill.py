@@ -146,6 +146,7 @@ def main(args):
     optimizer_img.zero_grad()
 
     criterion = nn.CrossEntropyLoss().to(args.device)
+    kl_loss = nn.KLDivLoss(reduction="batchmean")
     print('%s training begins'%get_time())
 
     expert_dir = os.path.join(args.buffer_path, args.dataset)
@@ -396,7 +397,7 @@ def main(args):
         for i in range(args.expert_epochs-1):
             middle = (args.syn_steps//args.expert_epochs)*(i+1)
             student_to_target[i+1] = middle
-            middle_params.append(torch.cat([p.data.to(args.device).reshape(-1) for p in expert_trajectory[start_epoch+middle]], 0))
+            middle_params.append(torch.cat([p.data.to(args.device).reshape(-1) for p in expert_trajectory[start_epoch+(i+1)]], 0))
             match_pool.append(middle)
         student_to_target[args.expert_epochs] = args.syn_steps
         match_pool.append(args.syn_steps)
@@ -485,13 +486,16 @@ def main(args):
                 
                 batch_img = get_images(c, args.align_bs).detach().to(args.device)
                 batch_label = torch.ones(args.align_bs, dtype=torch.long)*c
-                feas_real = student_net.module.feature_forward(batch_img, flat_param=expert_params)
+                feas_real = student_net.module.feature_forward(batch_syn, flat_param=expert_params)
                 
                 # align the feature
                 for layer in range(len(feas_syn)):
                     out = torch.mean(feas_syn[layer], dim=0)
                     target = torch.mean(feas_real[layer], dim=0)
-                    loss = torch.nn.functional.mse_loss(out, target)
+                    out = F.log_softmax(out, dim=1)
+                    target = F.softmax(target, dim=1)
+                    loss = kl_loss(out, target)
+                    # loss = torch.nn.functional.mse_loss(out, target)
                     sum_align_loss += loss
             
             # print(sum_align_loss)
