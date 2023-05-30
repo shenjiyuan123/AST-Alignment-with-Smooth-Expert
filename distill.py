@@ -11,6 +11,7 @@ from utils import get_dataset, get_network, get_eval_pool, evaluate_synset, get_
 import wandb
 import copy
 import random
+from generator import Generator
 from reparam_module import ReparamModule
 
 import warnings
@@ -104,10 +105,84 @@ def main(args):
         print('real images channel %d, mean = %.4f, std = %.4f'%(ch, torch.mean(images_all[:, ch]), torch.std(images_all[:, ch])))
 
 
-    def get_images(c, n):  # get random n images from class c
-        idx_shuffle = np.random.permutation(indices_class[c])[:n]
+    def get_images(c, ipc):  # get n random images from class c
+        idx_shuffle = np.random.permutation(indices_class[c])[:ipc]
         return images_all[idx_shuffle]
+    
+    def get_repre_images(ipc):  # get n representative images each class
+        expert_net = get_network(args.model, channel, num_classes, im_size, dist=False).to(args.device)
+        expert_files = []
+        expert_dir = os.path.join(args.buffer_path, args.dataset)
+        if args.dataset in ["CIFAR10", "CIFAR100"] and not args.zca:
+            expert_dir += "_NO_ZCA"
+        expert_dir = os.path.join(expert_dir, args.model)
+        path_num = 0
+        while os.path.exists(os.path.join(expert_dir, "replay_buffer_{}.pt".format(path_num))):
+            expert_files.append(os.path.join(expert_dir, "replay_buffer_{}.pt".format(path_num)))
+            path_num += 1
+        if path_num == 0:
+            raise AssertionError("No buffers detected at {}".format(expert_dir))
 
+        random.shuffle(expert_files)
+        buffer = torch.load(expert_files[0])
+        random.shuffle(buffer)
+        expert_para = buffer[0][-1]  # get the 50th epoch's parameters
+        
+        expert_para_odict = {}
+        for i,(k,v) in enumerate(expert_net.state_dict().items()):
+            if expert_para[i].shape==v.shape:
+                expert_para_odict[k] = expert_para[i]
+            else:
+                print(f'Error{i}!')
+        expert_net.load_state_dict(expert_para_odict)
+        
+        from sklearn.cluster import KMeans
+        from sklearn.decomposition import PCA
+        import matplotlib.pyplot as plt
+        
+        def distance(x,y):
+            return np.sum((x-y)**2, axis=1)
+        
+        repre_indices = []
+        fig, ax = plt.subplots(1, 5, figsize=(30,6))
+        visual = True if ipc<=10 else False 
+        
+        print("indices_class ",len(indices_class))
+        
+        for c in range(len(indices_class)):
+            images_per_class = images_all[indices_class[c]].to(args.device)
+            logist_per_class = expert_net(images_per_class)
+            logist = logist_per_class.cpu().data.numpy()
+            kmeans = KMeans(n_clusters=ipc, random_state=0).fit(logist)
+            centers = kmeans.cluster_centers_
+            pseudo_labels = kmeans.labels_
+            
+            # visualization, only show first 5 classes
+            if c<5 and visual:
+                pca = PCA(n_components=2).fit(logist)
+                logist_draw = pca.transform(logist)
+                center_draw = pca.transform(centers)
+                label_color = {0:'b', 1:'g', 2:'orange', 3:'c', 4:'m', 5:'y', 6:'dimgrey', 7:'pink', 8:'royalblue', 9:'wheat'}
+                random_init = random.sample(list(range(logist_draw.shape[0])), ipc)
+                for i, draw in enumerate(logist_draw):  
+                    if i in random_init:
+                        ax[c].scatter(draw[0], draw[1], c='darkviolet', marker='*', s=30)
+                    else:
+                        ax[c].scatter(draw[0], draw[1], c=label_color[pseudo_labels[i]], s=10)
+                for draw in center_draw:
+                    ax[c].scatter(draw[0], draw[1], c='r', marker='x', s=30)
+                ax[c].set_xlabel(f'Class {c}.')
+            
+            for center in centers:
+                dis = distance(center, logist)
+                min_dis_indice = np.argmin(dis)
+                repre_indices.append(indices_class[c][min_dis_indice])
+                
+        if visual:
+            fig.savefig('represent.pdf')
+        print(centers.shape, len(repre_indices))
+        return repre_indices
+    
 
     ''' initialize the synthetic data '''
     label_syn = torch.tensor([np.ones(args.ipc,dtype=np.int_)*i for i in range(num_classes)], dtype=torch.long, device=args.device).view(-1) # [0,0,0, 1,1,1, ..., 9,9,9]
@@ -131,6 +206,14 @@ def main(args):
                             [get_images(c, 1).detach().data for s in range(args.ipc)])
         for c in range(num_classes):
             image_syn.data[c * args.ipc:(c + 1) * args.ipc] = get_images(c, args.ipc).detach().data
+    elif args.pix_init == 'avg':
+        print('initialize synthetic data from the average of all real images')
+        image_syn.data = images_all[get_repre_images(args.ipc)].detach().data
+    elif args.pix_init == 'gan':
+        Gen = Generator()
+        dim = 100
+        img_base = torch.randn(size=(num_classes, dim), dtype=torch.float, requires_grad=True)      # 10*100
+        image_syn = Gen(img_base)       # 10*3*32*32
     else:
         print('initialize synthetic data from random noise')
 
@@ -146,7 +229,7 @@ def main(args):
     optimizer_img.zero_grad()
 
     criterion = nn.CrossEntropyLoss().to(args.device)
-    kl_loss = nn.KLDivLoss(reduction="batchmean")
+    kl_loss = nn.KLDivLoss(reduction="sum")
     print('%s training begins'%get_time())
 
     expert_dir = os.path.join(args.buffer_path, args.dataset)
@@ -162,13 +245,16 @@ def main(args):
         # input: one epoch's training result
         weight = []
         for i in network:
-            d_ = torch.normal(mean=0,std=1,size=i.size())
-            # Drop = nn.Dropout(p=0.0)
-            # d_ = Drop(d)
-            d_F = torch.norm(d_)
-            d_ /= d_F
-            weight_perturb = i + alpha*d_*i
-            weight.append(weight_perturb)
+            if len(i.shape)==4:
+                d_ = torch.normal(mean=0,std=1,size=i.size())
+                # Drop = nn.Dropout(p=0.0)
+                # d_ = Drop(d)
+                d_F = torch.norm(d_)
+                d_ /= d_F
+                weight_perturb = i + alpha*d_*i
+                weight.append(weight_perturb)
+            else:
+                weight.append(i)
         return weight
     
     def weightDropout(network, p=0.1):
@@ -283,7 +369,7 @@ def main(args):
 
                 wandb.log({"Pixels": wandb.Histogram(torch.nan_to_num(image_syn.detach().cpu()))}, step=it)
 
-                if args.ipc < 50 or args.force_save:
+                if args.ipc <= 50 or args.force_save:
                     upsampled = image_save
                     if args.dataset != "ImageNet":
                         upsampled = torch.repeat_interleave(upsampled, repeats=4, dim=2)
@@ -472,7 +558,7 @@ def main(args):
         ce_loss_total /= args.syn_steps
         wandb.log({"celoss/Inner_loss":ce_loss_total}, step=it)
 
-        
+        '''
         # alignment loss
         if args.align_loss:
             forward_params = student_params[-1].clone().detach()
@@ -501,7 +587,7 @@ def main(args):
             # print(sum_align_loss)
             # break
             wandb.log({"align_loss":sum_align_loss}, step=it)
-        
+        '''
         
         param_loss = torch.tensor(0.0).to(args.device)
         param_dist = torch.tensor(0.0).to(args.device)
@@ -521,8 +607,6 @@ def main(args):
         param_loss /= (param_dist)
         
         grand_loss = param_loss
-        if args.align_loss:
-            grand_loss += args.align_alpha* sum_align_loss
         if args.adaptive_middle_loss:
             for num, tmp in enumerate(middle_loss):
                 beta = (1/(1+len(middle_loss)))*(num+1)
@@ -548,6 +632,29 @@ def main(args):
 
         # if it == args.Iteration//2:
         #     optimizer_img = torch.optim.SGD([image_syn], lr=args.lr_img*0.5, momentum=0.5)
+        
+        if args.align_loss:
+            forward_params = student_params[-1].clone().detach()
+            expert_params  = target_params
+            sum_align_loss = 0.0
+            
+            for idx in range(args.ipc):
+                batch_syn = syn_images[idx::args.ipc]
+                print(len(batch_syn))
+                feas_syn = student_net.module(batch_syn, flat_param=forward_params)
+                feas_real = student_net.module(batch_syn, flat_param=expert_params)
+                
+                out = F.log_softmax(feas_syn, dim=1)
+                target = F.softmax(feas_real, dim=1)
+                loss = kl_loss(out, target)
+                print(loss)
+                sum_align_loss += loss
+                
+                optimizer_img.zero_grad()
+                loss.backward()
+                optimizer_img.step()
+            
+            wandb.log({"align_loss":sum_align_loss}, step=it)
 
         for _ in student_params:
             del _
@@ -598,7 +705,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch_syn', type=int, default=None, help='should only use this if you run out of VRAM')
     parser.add_argument('--batch_train', type=int, default=256, help='batch size for training networks')
 
-    parser.add_argument('--pix_init', type=str, default='real', choices=["noise", "real"],
+    parser.add_argument('--pix_init', type=str, default='real', choices=["noise", "real", "avg", "gan"],
                         help='noise/real: initialize synthetic images from random noise or randomly sampled real images.')
 
     parser.add_argument('--dsa', type=str, default='True', choices=['True', 'False'],
