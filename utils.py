@@ -72,12 +72,28 @@ def get_dataset(dataset, data_path, batch_size=1, subset="imagenette", args=None
         mean = [0.485, 0.456, 0.406]
         std = [0.229, 0.224, 0.225]
         if args.zca:
-            transform = transforms.Compose([transforms.ToTensor()])
+            transform = None
         else:
-            transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean=mean, std=std)])
-        dst_train = datasets.ImageFolder(os.path.join(data_path, "train"), transform=transform) # no augmentation
-        dst_test = datasets.ImageFolder(os.path.join(data_path, "val", "images"), transform=transform)
-        class_names = dst_train.classes
+            transform = transforms.Compose([transforms.Normalize(mean=mean, std=std)])
+        data = torch.load(os.path.join(data_path, 'tinyimagenet.pt'), map_location='cpu')
+        print('Load TinyImageNet successful!')
+        class_names = data['classes']
+
+        images_train = data['images_train']
+        labels_train = data['labels_train']
+        images_train = images_train.detach().float() / 255.0
+        labels_train = labels_train.detach()
+        
+        images_val = data['images_val']
+        labels_val = data['labels_val']
+        images_val = images_val.detach().float() / 255.0
+        labels_val = labels_val.detach()
+        
+        dst_train = TinyImgDataset(images_train, labels_train, transform=transform)
+        dst_test  = TinyImgDataset(images_val, labels_val, transform=transform)
+        # dst_train = datasets.ImageFolder(os.path.join(data_path, "train"), transform=transform) # no augmentation
+        # dst_test = datasets.ImageFolder(os.path.join(data_path, "val", "images"), transform=transform)
+        # class_names = dst_train.classes
         class_map = {x:x for x in range(num_classes)}
 
 
@@ -178,6 +194,20 @@ class TensorDataset(Dataset):
         self.labels = labels.detach()
 
     def __getitem__(self, index):
+        return self.images[index], self.labels[index]
+
+    def __len__(self):
+        return self.images.shape[0]
+    
+class TinyImgDataset(Dataset):
+    def __init__(self, images, labels, transform=None): # images: n x c x h x w tensor
+        self.images = images.detach().float()
+        self.labels = labels.detach()
+        self.transform = transform
+
+    def __getitem__(self, index):
+        if self.transform:
+            self.images[index] = self.transform(self.images[index])
         return self.images[index], self.labels[index]
 
     def __len__(self):
@@ -346,7 +376,7 @@ def epoch_flat(mode, dataloader, net, optimizer, loss_decay, criterion, args, au
 
     return loss_avg, acc_avg
 
-def epoch_gp(mode, loss_decay, dataloader, net, optimizer, criterion, args, aug, texture=False, LAMBDA=0.1):
+def epoch_gp(mode, loss_decay, dataloader, net, optimizer, criterion, args, aug, texture=False, LAMBDA=2):
     loss_avg, acc_avg, num_exp = 0, 0, 0
     net = net.to(args.device)
 

@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 from utils import get_dataset, get_network, get_daparam,\
-    TensorDataset, epoch, epoch_flat, epoch_gp, ParamDiffAug
+    TensorDataset, epoch, ParamDiffAug
 import copy
 
 import warnings
@@ -70,15 +70,7 @@ def main(args):
         teacher_net = get_network(args.model, channel, num_classes, im_size).to(args.device) # get a random model
         teacher_net.train()
         lr = args.lr_teacher
-        if args.optim == 'ADAM':
-            teacher_optim = torch.optim.Adam(teacher_net.parameters(), lr=lr)
-        elif args.optim == 'SGDMOM':
-            teacher_optim = torch.optim.SGD(teacher_net.parameters(), lr=lr, momentum=args.mom, weight_decay=args.l2)  # optimizer_img for synthetic data
-        elif args.optim == 'SGD':
-            teacher_optim = torch.optim.SGD(teacher_net.parameters(), lr=lr, momentum=0, weight_decay=0)  # optimizer_img for synthetic data
-        else:
-            raise NotImplementedError
-        
+        teacher_optim = torch.optim.SGD(teacher_net.parameters(), lr=lr, momentum=args.mom, weight_decay=args.l2)  # optimizer_img for synthetic data
         teacher_optim.zero_grad()
 
         timestamps = []
@@ -86,53 +78,27 @@ def main(args):
         timestamps.append([p.detach().cpu() for p in teacher_net.parameters()])
 
         lr_schedule = [args.train_epochs // 2 + 1]
-        
-        if args.loss_decay:
-            loss_decay = [0.5,0.55,0.6,0.65,0.7,0.75,0.8,0.85,0.9,0.95]
-        else:
-            loss_decay = []
 
         for e in range(args.train_epochs):
-            if args.gp=='False':
-                if e<len(loss_decay):
-                    train_loss, train_acc = epoch_flat("train", loss_decay=loss_decay[e], dataloader=trainloader, net=teacher_net, optimizer=teacher_optim,
-                                            criterion=criterion, args=args, aug=True)
-                    print("epoch flat")
-                else:
-                    train_loss, train_acc = epoch("train", dataloader=trainloader, net=teacher_net, optimizer=teacher_optim,
-                                            criterion=criterion, args=args, aug=True)
-            else:
-                if e<len(loss_decay):
-                    train_loss, train_acc = epoch_gp("train", loss_decay=loss_decay[e], dataloader=trainloader, net=teacher_net, optimizer=teacher_optim,
-                                            criterion=criterion, args=args, aug=True)
-                    print("epoch flat")
-                else: 
-                    train_loss, train_acc = epoch_gp("train", loss_decay=1, dataloader=trainloader, net=teacher_net, optimizer=teacher_optim,
-                                            criterion=criterion, args=args, aug=True)
-                
+
+            train_loss, train_acc = epoch("train", dataloader=trainloader, net=teacher_net, optimizer=teacher_optim,
+                                        criterion=criterion, args=args, aug=True)
 
             test_loss, test_acc = epoch("test", dataloader=testloader, net=teacher_net, optimizer=None,
                                         criterion=criterion, args=args, aug=False)
 
-            print("Itr: {}\tEpoch: {}\tLR {}\tTrain Acc: {}\tTest Acc: {},".format(it, e, lr, train_acc, test_acc))
+            print("Itr: {}\tEpoch: {}\tTrain Acc: {}\tTest Acc: {}".format(it, e, train_acc, test_acc))
 
             timestamps.append([p.detach().cpu() for p in teacher_net.parameters()])
 
-            if e in lr_schedule:
-                lr *= 0.6
-                if args.optim == 'ADAM':
-                    teacher_optim = torch.optim.Adam(teacher_net.parameters(), lr=lr)
-                elif args.optim == 'SGDMOM':
-                    teacher_optim = torch.optim.SGD(teacher_net.parameters(), lr=lr, momentum=args.mom, weight_decay=args.l2)  # optimizer_img for synthetic data
-                elif args.optim == 'SGD':
-                    teacher_optim = torch.optim.SGD(teacher_net.parameters(), lr=lr, momentum=0, weight_decay=0)  # optimizer_img for synthetic data
-                else:
-                    raise NotImplementedError
+            if e in lr_schedule and args.decay:
+                lr *= 0.1
+                teacher_optim = torch.optim.SGD(teacher_net.parameters(), lr=lr, momentum=args.mom, weight_decay=args.l2)
                 teacher_optim.zero_grad()
 
         trajectories.append(timestamps)
 
-        if len(trajectories) == 1:
+        if len(trajectories) == args.save_interval:
             n = 0
             while os.path.exists(os.path.join(save_dir, "replay_buffer_{}.pt".format(n))):
                 n += 1
@@ -147,7 +113,7 @@ if __name__ == '__main__':
     parser.add_argument('--subset', type=str, default='imagenette', help='subset')
     parser.add_argument('--model', type=str, default='ConvNet', help='model')
     parser.add_argument('--num_experts', type=int, default=100, help='training iterations')
-    parser.add_argument('--lr_teacher', type=float, default=0.003, help='learning rate for updating network parameters')
+    parser.add_argument('--lr_teacher', type=float, default=0.01, help='learning rate for updating network parameters')
     parser.add_argument('--batch_train', type=int, default=256, help='batch size for training networks')
     parser.add_argument('--batch_real', type=int, default=256, help='batch size for real loader')
     parser.add_argument('--dsa', type=str, default='True', choices=['True', 'False'],
@@ -159,14 +125,10 @@ if __name__ == '__main__':
     parser.add_argument('--train_epochs', type=int, default=50)
     parser.add_argument('--zca', action='store_true')
     parser.add_argument('--decay', action='store_true')
-    parser.add_argument('--mom', type=float, default=0.9, help='momentum')
-    parser.add_argument('--l2', type=float, default=0.001, help='l2 regularization')
-    parser.add_argument('--gp', type=str, default='False', choices=['True', 'False'], help='gradient penalty')
-    parser.add_argument('--loss_decay', action='store_true')
-    parser.add_argument('--optim', default='SGDMOM', choices=['SGDMOM','ADAM','SGD'])
-    parser.add_argument('--save_interval', type=int, default=5)
+    parser.add_argument('--mom', type=float, default=0, help='momentum')
+    parser.add_argument('--l2', type=float, default=0, help='l2 regularization')
+    parser.add_argument('--save_interval', type=int, default=10)
 
     args = parser.parse_args()
     main(args)
-
-
+    

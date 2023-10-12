@@ -110,6 +110,7 @@ def main(args):
         return images_all[idx_shuffle]
     
     def get_repre_images(ipc):  # get n representative images each class
+        ipc_visual = 10
         expert_net = get_network(args.model, channel, num_classes, im_size, dist=False).to(args.device)
         expert_files = []
         expert_dir = os.path.join(args.buffer_path, args.dataset)
@@ -145,7 +146,7 @@ def main(args):
         
         repre_indices = []
         fig, ax = plt.subplots(1, 5, figsize=(30,6))
-        visual = True if ipc<=10 else False 
+        visual = True if ipc_visual<=10 else False 
         
         print("indices_class ",len(indices_class))
         
@@ -153,33 +154,41 @@ def main(args):
             images_per_class = images_all[indices_class[c]].to(args.device)
             logist_per_class = expert_net(images_per_class)
             logist = logist_per_class.cpu().data.numpy()
-            kmeans = KMeans(n_clusters=ipc, random_state=0).fit(logist)
+            kmeans = KMeans(n_clusters=ipc_visual, random_state=0).fit(logist)
             centers = kmeans.cluster_centers_
             pseudo_labels = kmeans.labels_
             
+            kmeans_ipc = KMeans(n_clusters=ipc, random_state=0).fit(logist)
+            centers_ipc = kmeans_ipc.cluster_centers_
+            
+            for center in centers:
+                # choose args.ipc/ipc_visual points as the representative initialization samples
+                dis = distance(center, logist)
+                # min_dis_indice = np.argmin(dis)
+                min_dis_indice = np.argsort(dis)[:int(ipc/ipc_visual)].tolist()
+                for tmp in min_dis_indice:
+                    repre_indices.append(indices_class[c][tmp])
+                    
             # visualization, only show first 5 classes
             if c<5 and visual:
                 pca = PCA(n_components=2).fit(logist)
                 logist_draw = pca.transform(logist)
                 center_draw = pca.transform(centers)
-                label_color = {0:'b', 1:'g', 2:'orange', 3:'c', 4:'m', 5:'y', 6:'dimgrey', 7:'pink', 8:'royalblue', 9:'wheat'}
+                label_color = {0:'#0066CC', 1:'#00CCCC', 2:'#3399FF', 3:'#66FFFF', 4:'#CCFFFF', 5:'#CCE5FF', 6:'#66B2FF', 7:'#0080FF', 8:'#9999FF', 9:'#CCFFE5'}
                 random_init = random.sample(list(range(logist_draw.shape[0])), ipc)
                 for i, draw in enumerate(logist_draw):  
                     if i in random_init:
-                        ax[c].scatter(draw[0], draw[1], c='darkviolet', marker='*', s=30)
+                        # ax[c].scatter(draw[0], draw[1], c='#202020', marker='x', s=20, zorder=2)
+                        continue
                     else:
-                        ax[c].scatter(draw[0], draw[1], c=label_color[pseudo_labels[i]], s=10)
+                        ax[c].scatter(draw[0], draw[1], c=label_color[pseudo_labels[i]], s=8,zorder=1)
                 for draw in center_draw:
-                    ax[c].scatter(draw[0], draw[1], c='r', marker='x', s=30)
+                    ax[c].scatter(draw[0], draw[1], c='r', marker='*', s=30, zorder=3)
                 ax[c].set_xlabel(f'Class {c}.')
-            
-            for center in centers:
-                dis = distance(center, logist)
-                min_dis_indice = np.argmin(dis)
-                repre_indices.append(indices_class[c][min_dis_indice])
+
                 
         if visual:
-            fig.savefig('represent.pdf')
+            fig.savefig('represent_new.pdf',bbox_inches='tight',pad_inches=0)
         print(centers.shape, len(repre_indices))
         return repre_indices
     
