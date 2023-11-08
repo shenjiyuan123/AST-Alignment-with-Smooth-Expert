@@ -1,0 +1,1 @@
+# AST: Distilling Dataset through Alignment with Smooth and High-Quality Expert Trajectories
