@@ -16,7 +16,7 @@ Worse (but still interesting) results can be obtained faster through training fe
 
 
 
-## Distillation by Matching Training Trajectories
+## Distillation by Alignment with Smooth Expert Trajectories
 The following command will then use the buffers we just generated to distill CIFAR-100 down to just 1 image per class:
 ```bash
 python distill.py --dataset=CIFAR100 --ipc=1 --pix_init avg --weight_perturb --agg_middle_loss --balance_loss --syn_steps=20 --expert_epochs=3 --max_start_epoch=20 --zca --lr_img=1000 --lr_lr=1e-05 --lr_teacher=0.01 --buffer_path={path_to_buffer_storage} --data_path={path_to_dataset}
